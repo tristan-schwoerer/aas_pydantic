@@ -77,13 +77,12 @@ class Identifiable(Referable):
 
 class HasSemantics(BaseModel):
     """
-    Base class for all classes that have semantics of the AAS meta model. Semantics are defined by a semantic id, which reference the semantic definition of the object.
-
-    Args:
-        semantic_id (str): Semantic id of the object. Defaults to None.
+    Base class for all classes that have semantics of the AAS meta model.
     """
 
     semantic_id: str = ""
+    supplemental_semantic_ids: List[str] = []
+    qualifiers: List[dict] = []
 
 
 class AAS(Identifiable):
@@ -171,7 +170,7 @@ class SubmodelElementCollection(HasSemantics, Referable):
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         for field_name in self.model_fields:
-            if field_name in ["id", "id_short", "description", "semantic_id"]:
+            if field_name in ["id", "id_short", "description", "semantic_id", "qualifiers", "supplemental_semantic_ids"]:
                 continue
             assert is_valid_submodel_element(
                 getattr(self, field_name)
@@ -227,7 +226,7 @@ class Submodel(HasSemantics, Identifiable):
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         for field_name in self.model_fields:
-            if field_name in ["id", "id_short", "description", "semantic_id"]:
+            if field_name in ["id", "id_short", "description", "semantic_id", "qualifiers", "supplemental_semantic_ids"]:
                 continue
             assert is_valid_submodel_element(
                 getattr(self, field_name)

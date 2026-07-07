@@ -42,6 +42,7 @@ example_device = DeviceAAS(
     description="Example device",
     device_info=DeviceConfig(
         id_short="device_1_config",
+        semantic_id="",
         description="Device 1 Configuration",
         properties=DeviceProperties(
             id_short="device_1_properties",

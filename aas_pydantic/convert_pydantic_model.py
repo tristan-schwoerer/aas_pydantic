@@ -88,6 +88,9 @@ def convert_model_to_submodel(
     submodel_element_data_specifications = []
 
     for attribute_info in submodel_attributes:
+        # Skip metadata fields (not actual submodel elements)
+        if attribute_info.name in ("qualifiers", "supplemental_semantic_ids"):
+            continue
         # Pass field_info so create_submodel_element can read AAS metadata
         submodel_element = create_submodel_element(
             attribute_info.name, attribute_info.value,
@@ -139,21 +142,37 @@ def create_submodel_element(
     ],
     field_info=None,
 ) -> Optional[model.SubmodelElement]:
-    """Create a basyx SubmodelElement — type-based dispatch with per-field metadata injection."""
+    """Create a basyx SubmodelElement — type-based dispatch."""
     if not attribute_value and not (isinstance(attribute_value, bool) or attribute_value == 0):
         return None
 
+    # Metadata: for model types read from the instance; for primitives from field_info
     aas_meta = get_aas_meta(field_info) if field_info else {}
-    sid = _make_external_reference(aas_meta["semantic_id"]) if aas_meta.get("semantic_id") else None
-    quals = _make_qualifiers(aas_meta.get("qualifiers", [])) if aas_meta.get("qualifiers") else []
-    suppl = [_make_external_reference(s) for s in aas_meta.get("supplemental_semantic_ids", [])] if aas_meta.get("supplemental_semantic_ids") else []
-    desc = model.MultiLanguageTextType({"en": aas_meta["description"]}) if aas_meta.get("description") else None
+    sid = (_make_external_reference(aas_meta["semantic_id"])
+           if aas_meta.get("semantic_id") else None)
+    quals_meta = aas_meta.get("qualifiers", [])
+    suppl_meta = aas_meta.get("supplemental_semantic_ids", [])
+    desc_text = aas_meta.get("description")
+
+    def _model_metadata(inst):
+        """Read qualifiers/supplemental from a model instance (HasSemantics fields)."""
+        q = _make_qualifiers(getattr(inst, 'qualifiers', None) or quals_meta)
+        s = ([_make_external_reference(x) for x in (getattr(inst, 'supplemental_semantic_ids', None) or suppl_meta)]
+             if (getattr(inst, 'supplemental_semantic_ids', None) or suppl_meta) else [])
+        d = (model.MultiLanguageTextType({"en": desc_text}) if desc_text
+             else (convert_util.get_basyx_description_from_model(inst) if inst.description else None))
+        return q, s, d
+
+    quals = _make_qualifiers(quals_meta) if quals_meta else []
+    suppl = [_make_external_reference(s) for s in suppl_meta] if suppl_meta else []
+    desc = model.MultiLanguageTextType({"en": desc_text}) if desc_text else None
 
     if isinstance(attribute_value, aas_model.SubmodelElementCollection):
         smc = create_submodel_element_collection(attribute_value)
-        if quals: smc.qualifier = quals
-        if suppl: smc.supplemental_semantic_id = suppl
-        if desc: smc.description = desc
+        q, s, d = _model_metadata(attribute_value)
+        if q: smc.qualifier = q
+        if s: smc.supplemental_semantic_id = s
+        if d: smc.description = d
         return smc
 
     if isinstance(attribute_value, (list, tuple, set)):
@@ -172,10 +191,12 @@ def create_submodel_element(
         return model.ReferenceElement(id_short=attribute_name, value=ref, semantic_id=sid, qualifier=quals, supplemental_semantic_id=suppl, description=desc)
 
     if isinstance(attribute_value, aas_model.Capability):
-        return model.Capability(id_short=attribute_name, semantic_id=sid or get_semantic_id(attribute_value), qualifier=quals, supplemental_semantic_id=suppl, description=desc)
+        q, s, d = _model_metadata(attribute_value)
+        return model.Capability(id_short=attribute_name, semantic_id=sid or get_semantic_id(attribute_value), qualifier=q, supplemental_semantic_id=s, description=d)
 
     if isinstance(attribute_value, aas_model.Operation):
-        return create_operation(attribute_name, attribute_value, sid, quals, suppl, desc)
+        q, s, d = _model_metadata(attribute_value)
+        return create_operation(attribute_name, attribute_value, sid, q, s, d)
 
     if isinstance(attribute_value, aas_model.File):
         return create_file(attribute_value)
@@ -216,6 +237,9 @@ def create_submodel_element_collection(
     submodel_element_data_specifications = []
 
     for attribute_info in smc_attributes:
+        # Skip metadata fields (not actual submodel elements)
+        if attribute_info.name in ("qualifiers", "supplemental_semantic_ids"):
+            continue
         sme = create_submodel_element(
             attribute_info.name, attribute_info.value,
             field_info=attribute_info.field_info,
@@ -370,4 +394,57 @@ def create_blob(attribute_value: aas_model.Blob) -> model.Blob:
         semantic_id=attribute_value.semantic_id,
         content_type=attribute_value.media_type,
         value=attribute_value.content,
+    )
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+def _make_external_reference(uri: str) -> model.ExternalReference:
+    return model.ExternalReference(
+        key=(model.Key(type_=model.KeyTypes.GLOBAL_REFERENCE, value=uri),)
+    )
+
+
+def _make_qualifiers(qds: list) -> list:
+    result = []
+    for qd in qds:
+        kwargs = {
+            "type_": qd["type"],
+            "value_type": model.datatypes.String,
+            "value": qd["value"],
+            "kind": model.QualifierKind.TEMPLATE_QUALIFIER,
+        }
+        if "semantic_id" in qd:
+            kwargs["semantic_id"] = _make_external_reference(qd["semantic_id"])
+        result.append(model.Qualifier(**kwargs))
+    return result
+
+
+def create_operation(
+    attribute_name: str,
+    op: aas_model.Operation,
+    sid=None, quals=None, suppl=None, desc=None,
+) -> model.Operation:
+    """Create a basyx Operation from an aas_pydantic Operation model."""
+    input_vars = [
+        create_submodel_element(f"input_{i}", v)
+        for i, v in enumerate(op.input_variables)
+    ]
+    output_vars = [
+        create_submodel_element(f"output_{i}", v)
+        for i, v in enumerate(op.output_variables)
+    ]
+    inoutput_vars = [
+        create_submodel_element(f"inoutput_{i}", v)
+        for i, v in enumerate(op.inoutput_variables)
+    ]
+    return model.Operation(
+        id_short=attribute_name,
+        input_variable=input_vars,
+        output_variable=output_vars,
+        inoutput_variable=inoutput_vars,
+        semantic_id=sid or get_semantic_id(op),
+        qualifier=quals or [],
+        supplemental_semantic_id=suppl or [],
+        description=desc,
     )
