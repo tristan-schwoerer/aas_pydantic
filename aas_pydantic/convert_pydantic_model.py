@@ -12,7 +12,9 @@ from typing import Optional, Union
 from aas_pydantic import convert_util, aas_model
 
 from aas_pydantic.convert_util import (
+    AAS_META_KEY,
     convert_primitive_type_to_xsdtype,
+    get_aas_meta,
     get_attribute_infos,
     get_id_short,
     get_semantic_id,
@@ -77,6 +79,7 @@ def convert_model_to_aas(
 
 def convert_model_to_submodel(
     model_submodel: aas_model.Submodel,
+    administration: Optional[model.AdministrativeInformation] = None,
 ) -> Optional[model.Submodel]:
     if not model_submodel:
         return
@@ -85,8 +88,10 @@ def convert_model_to_submodel(
     submodel_element_data_specifications = []
 
     for attribute_info in submodel_attributes:
+        # Pass field_info so create_submodel_element can read AAS metadata
         submodel_element = create_submodel_element(
-            attribute_info.name, attribute_info.value
+            attribute_info.name, attribute_info.value,
+            field_info=attribute_info.field_info,
         )
         attribute_data_specification = (
             convert_util.get_data_specification_for_attribute(
@@ -107,7 +112,8 @@ def convert_model_to_submodel(
                     attribute_info, submodel_element
                 )
             )
-            submodel_element_data_specifications.append(default_data_specification)
+            if default_data_specification:
+                submodel_element_data_specifications.append(default_data_specification)
         if submodel_element:
             submodel_elements.append(submodel_element)
 
@@ -121,6 +127,7 @@ def convert_model_to_submodel(
         + submodel_element_data_specifications,
         semantic_id=get_semantic_id(model_submodel),
         submodel_element=submodel_elements,
+        administration=administration,
     )
     return basyx_submodel
 
@@ -130,50 +137,58 @@ def create_submodel_element(
     attribute_value: Union[
         aas_model.SubmodelElementCollection, str, float, int, bool, tuple, list, set
     ],
+    field_info=None,
 ) -> Optional[model.SubmodelElement]:
-    """
-    Create a basyx SubmodelElement from a model SubmodelElementCollection or a primitive type
-
-    Args:
-        attribute_name (str): Name of the attribute that is used for ID and id_short
-        attribute_value (Union[ aas_model.SubmodelElementCollection, str, float, int, bool, tuple, list, set ]): Value of the attribute
-
-
-    Returns:
-        model.SubmodelElement: basyx SubmodelElement
-    """
+    """Create a basyx SubmodelElement — type-based dispatch with per-field metadata injection."""
     if not attribute_value and not (isinstance(attribute_value, bool) or attribute_value == 0):
-        return
+        return None
+
+    aas_meta = get_aas_meta(field_info) if field_info else {}
+    sid = _make_external_reference(aas_meta["semantic_id"]) if aas_meta.get("semantic_id") else None
+    quals = _make_qualifiers(aas_meta.get("qualifiers", [])) if aas_meta.get("qualifiers") else []
+    suppl = [_make_external_reference(s) for s in aas_meta.get("supplemental_semantic_ids", [])] if aas_meta.get("supplemental_semantic_ids") else []
+    desc = model.MultiLanguageTextType({"en": aas_meta["description"]}) if aas_meta.get("description") else None
+
     if isinstance(attribute_value, aas_model.SubmodelElementCollection):
-        smc = create_submodel_element_collection(attribute_value)
+        smc = create_submodel_element_collection(attribute_value, field_info)
+        if sid: smc.semantic_id = sid
+        if quals: smc.qualifier = quals
+        if suppl: smc.supplemental_semantic_id = suppl
+        if desc: smc.description = desc
         return smc
-    elif isinstance(attribute_value, (list, tuple, set)):
-        sml = create_submodel_element_list(attribute_name, attribute_value)
+
+    if isinstance(attribute_value, (list, tuple, set)):
+        sml = create_submodel_element_list(attribute_name, attribute_value, field_info)
+        if sid: sml.semantic_id = sid
+        if quals: sml.qualifier = quals
+        if suppl: sml.supplemental_semantic_id = suppl
+        if desc: sml.description = desc
         return sml
-    elif (isinstance(attribute_value, str)) and (
-        (
-            parse.urlparse(attribute_value).scheme
-            and parse.urlparse(attribute_value).netloc
-        )
-        or (attribute_value.split("_")[-1] in ["id", "ids"])
+
+    if isinstance(attribute_value, str) and (
+        (parse.urlparse(attribute_value).scheme and parse.urlparse(attribute_value).netloc)
+        or attribute_value.split("_")[-1] in ["id", "ids"]
     ):
-        key = model.Key(
-            type_=model.KeyTypes.ASSET_ADMINISTRATION_SHELL,
-            value=attribute_value,
-        )
-        reference = model.ModelReference(key=(key,), type_="")
-        reference_element = model.ReferenceElement(
-            id_short=attribute_name,
-            value=reference,
-        )
-        return reference_element
-    elif isinstance(attribute_value, aas_model.File):
+        ref = model.ModelReference(key=(model.Key(type_=model.KeyTypes.ASSET_ADMINISTRATION_SHELL, value=attribute_value),), type_="")
+        return model.ReferenceElement(id_short=attribute_name, value=ref, semantic_id=sid, qualifier=quals, supplemental_semantic_id=suppl, description=desc)
+
+    if isinstance(attribute_value, aas_model.Capability):
+        return model.Capability(id_short=attribute_name, semantic_id=sid or get_semantic_id(attribute_value), qualifier=quals, supplemental_semantic_id=suppl, description=desc)
+
+    if isinstance(attribute_value, aas_model.Operation):
+        return create_operation(attribute_name, attribute_value, sid, quals, suppl, desc)
+
+    if isinstance(attribute_value, aas_model.File):
         return create_file(attribute_value)
-    elif isinstance(attribute_value, aas_model.Blob):
+    if isinstance(attribute_value, aas_model.Blob):
         return create_blob(attribute_value)
-    else:
-        property = create_property(attribute_name, attribute_value)
-        return property
+
+    prop = create_property(attribute_name, attribute_value)
+    if sid: prop.semantic_id = sid
+    if quals: prop.qualifier = quals
+    if suppl: prop.supplemental_semantic_id = suppl
+    if desc: prop.description = desc
+    return prop
 
 
 def create_property(
@@ -196,13 +211,17 @@ def create_property(
 
 def create_submodel_element_collection(
     model_sec: aas_model.SubmodelElementCollection,
+    parent_field_info=None,  # Optional[FieldInfo] — for AAS metadata on the SMC itself
 ) -> model.SubmodelElementCollection:
     value = []
     smc_attributes = get_attribute_infos(model_sec)
     submodel_element_data_specifications = []
 
     for attribute_info in smc_attributes:
-        sme = create_submodel_element(attribute_info.name, attribute_info.value)
+        sme = create_submodel_element(
+            attribute_info.name, attribute_info.value,
+            field_info=attribute_info.field_info,
+        )
         attribute_data_specification = (
             convert_util.get_data_specification_for_attribute(attribute_info, sme)
         )
@@ -223,11 +242,21 @@ def create_submodel_element_collection(
                     attribute_info, sme
                 )
             )
-            submodel_element_data_specifications.append(default_data_specification)
+            if default_data_specification:
+                submodel_element_data_specifications.append(default_data_specification)
         if sme:
             value.append(sme)
 
     id_short = get_id_short(model_sec)
+
+    # Read AAS metadata from parent field (for semantic_id/qualifiers on the SMC itself)
+    aas_meta = get_aas_meta(parent_field_info) if parent_field_info else {}
+    smc_sid = (_make_external_reference(aas_meta["semantic_id"])
+               if aas_meta.get("semantic_id") else get_semantic_id(model_sec))
+    smc_quals = (_make_qualifiers(aas_meta.get("qualifiers", []))
+                 if aas_meta.get("qualifiers") else [])
+    smc_suppl = ([_make_external_reference(s) for s in aas_meta.get("supplemental_semantic_ids", [])]
+                 if aas_meta.get("supplemental_semantic_ids") else [])
 
     smc = model.SubmodelElementCollection(
         id_short=id_short,
@@ -237,7 +266,9 @@ def create_submodel_element_collection(
             model_sec
         )
         + submodel_element_data_specifications,
-        semantic_id=get_semantic_id(model_sec),
+        semantic_id=smc_sid,
+        qualifier=smc_quals,
+        supplemental_semantic_id=smc_suppl,
     )
     return smc
 
@@ -260,12 +291,13 @@ def patch_id_short_with_temp_attribute(
 
 
 def create_submodel_element_list(
-    attribute_name: str, value: list | tuple | set
+    attribute_name: str, value: list | tuple | set,
+    field_info=None,  # Optional[FieldInfo] — for list-level AAS metadata
 ) -> model.SubmodelElementList:
     submodel_elements = []
     submodel_element_ids = OrderedDict()
     for el in value:
-        submodel_element = create_submodel_element(attribute_name, el)
+        submodel_element = create_submodel_element(attribute_name, el, field_info=field_info)
         if isinstance(submodel_element, model.SubmodelElementCollection):
             if submodel_element.id_short in submodel_element_ids:
                 raise ValueError(
@@ -274,6 +306,11 @@ def create_submodel_element_list(
             submodel_element_ids.update({submodel_element.id_short: None})
             patch_id_short_with_temp_attribute(submodel_element)
         submodel_element.id_short = None
+        # Clear individual semantic_ids (AASd-114: all SML items share the list's semantic_id)
+        if hasattr(submodel_element, 'semantic_id') and submodel_element.semantic_id:
+            if hasattr(submodel_element, 'supplemental_semantic_id'):
+                submodel_element.supplemental_semantic_id = []
+            submodel_element.semantic_id = None
         submodel_elements.append(submodel_element)
 
     if submodel_elements and isinstance(submodel_elements[0], model.Property):

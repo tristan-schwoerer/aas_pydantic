@@ -145,6 +145,8 @@ def is_valid_submodel_element(submodel_element: Any) -> bool:
         return all(is_valid_submodel_element(element) for element in submodel_element)
     elif isinstance(submodel_element, Operation):
         return True
+    elif isinstance(submodel_element, Capability):
+        return True
     elif isinstance(submodel_element, File):
         return True
     elif isinstance(submodel_element, Blob):
@@ -178,9 +180,15 @@ class SubmodelElementCollection(HasSemantics, Referable):
 
 
 class Operation(HasSemantics, Referable):
-    input_variables: List[SubmodelElement]
-    output_variables: List[SubmodelElement]
-    inoutput_variables: List[SubmodelElement]
+    id_short: AasIdString = "Operation"  # overridable default
+    input_variables: List[SubmodelElement] = []
+    output_variables: List[SubmodelElement] = []
+    inoutput_variables: List[SubmodelElement] = []
+
+
+class Capability(HasSemantics, Referable):
+    """AAS Capability element — marker with no value, just id_short + semantic_id."""
+    id_short: AasIdString = "Capability"  # overridable default
 
 
 class File(HasSemantics, Referable):
@@ -199,6 +207,7 @@ SubmodelElement = (
     | SubmodelElementCollection
     | List["SubmodelElement"]
     | Operation
+    | Capability
     | Blob
     | File
 )

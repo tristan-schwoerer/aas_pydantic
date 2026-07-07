@@ -15,6 +15,19 @@ from pydantic.fields import FieldInfo
 from aas_pydantic import aas_model
 
 
+# ── AAS metadata reader (for Field.json_schema_extra["aas"]) ─────────────
+
+AAS_META_KEY = "aas"
+
+
+def get_aas_meta(field_info: FieldInfo) -> Dict[str, Any]:
+    """Extract AAS metadata from a Pydantic FieldInfo."""
+    extra = field_info.json_schema_extra or {}
+    if isinstance(extra, dict):
+        return extra.get(AAS_META_KEY, {})
+    return {}
+
+
 class AttributeFieldInfo(BaseModel):
     name: str
     field_info: FieldInfo
@@ -394,6 +407,10 @@ def get_default_data_specification_for_attribute(
         NoneType, aas_model.AAS, aas_model.Submodel, aas_model.SubmodelElementCollection
     ],
 ) -> typing.Optional[model.EmbeddedDataSpecification]:
+    default_val = attribute_field_info.field_info.default
+    # Avoid IEC61360 crash on empty/falsy defaults
+    if default_val is None or default_val == "" or default_val == 0:
+        return None
     model_keys = get_model_keys_for_data_specification(basyx_attribute)
     return model.EmbeddedDataSpecification(
         data_specification=model.ExternalReference(
@@ -401,7 +418,7 @@ def get_default_data_specification_for_attribute(
         ),
         data_specification_content=model.DataSpecificationIEC61360(
             preferred_name=model.LangStringSet({"en": "default"}),
-            value=attribute_field_info.field_info.default,
+            value=str(default_val),
         ),
     )
 
