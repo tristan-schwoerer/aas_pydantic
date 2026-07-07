@@ -2,8 +2,8 @@
 
 Usage::
 
-    from aas_pydantic.templates.capability_description import CapabilityDescription
-    from aas_pydantic.templates.nameplate import Nameplate
+    from aas_pydantic.submodel_templates.capability_description import CapabilityDescription
+    from aas_pydantic.submodel_templates.nameplate import Nameplate
 
 Regenerate::
 

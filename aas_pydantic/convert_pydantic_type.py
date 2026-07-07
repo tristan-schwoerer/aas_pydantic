@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 def convert_model_to_aas_template(
-    model_type: type[aas_model.AAS],
+    model_type: type[aas_model.AssetAdministrationShell],
 ) -> model.DictObjectStore[model.Identifiable]:
     """
     Convert a model aas to an Basyx AssetAdministrationShell and return it as a DictObjectStore with all Submodels
 
     Args:
-        model_type (type[aas_model.AAS]): Type of the model
+        model_type (type[aas_model.AssetAdministrationShell]): Type of the model
 
     Returns:
         model.DictObjectStore[model.Identifiable]: DictObjectStore with all Submodels

@@ -16,7 +16,7 @@ from aas_pydantic.convert_util import (
 
 
 def get_types_name_dict(
-    types: typing.List[typing.Type[aas_model.AAS | aas_model.Submodel]],
+    types: typing.List[typing.Type[aas_model.AssetAdministrationShell | aas_model.Submodel]],
 ) -> typing.Dict[str, type]:
     """
     Returns a dictionary with the type names as keys and the types as values.
@@ -29,7 +29,7 @@ def get_types_name_dict(
     """
     types_name_dict = {t.__name__.split(".")[-1]: t for t in types}
     for top_level_type in types:
-        if not issubclass(top_level_type, aas_model.AAS):
+        if not issubclass(top_level_type, aas_model.AssetAdministrationShell):
             continue
         for attribute_name, attribute_type in top_level_type.model_fields.items():
             if typing.get_origin(attribute_type.annotation) is typing.Union:
@@ -52,7 +52,7 @@ def get_types_name_dict(
 
 def convert_object_store_to_pydantic_models(
     obj_store: model.DictObjectStore, types: typing.List[type]
-) -> typing.List[aas_model.AAS]:
+) -> typing.List[aas_model.AssetAdministrationShell]:
     """
     Converts an object store with AAS and submodels to pydantic models, representing the original data structure.
 
@@ -61,7 +61,7 @@ def convert_object_store_to_pydantic_models(
         types (typing.List[type]): List of types to create the pydantic models from. Can be only top level types.
 
     Returns:
-        typing.List[aas_model.AAS]: List of pydantic models
+        typing.List[aas_model.AssetAdministrationShell]: List of pydantic models
     """
     type_name_dict = get_types_name_dict(types)
 
@@ -77,7 +77,7 @@ def convert_object_store_to_pydantic_models(
         )
         pydantic_submodels.append(pydantic_submodel)
 
-    pydantic_aas_list: typing.List[aas_model.AAS] = []
+    pydantic_aas_list: typing.List[aas_model.AssetAdministrationShell] = []
     for identifiable in obj_store:
         if not isinstance(identifiable, model.AssetAdministrationShell):
             continue
@@ -95,8 +95,8 @@ def convert_object_store_to_pydantic_models(
 def convert_aas_to_pydantic_model_instance(
     aas: model.AssetAdministrationShell,
     pydantic_submodels: typing.List[aas_model.Submodel],
-    model_type: type = aas_model.AAS,
-) -> aas_model.AAS:
+    model_type: type = aas_model.AssetAdministrationShell,
+) -> aas_model.AssetAdministrationShell:
     """
     Converts an AAS to a Pydantic model.
 
@@ -104,7 +104,7 @@ def convert_aas_to_pydantic_model_instance(
         aas (model.AssetAdministrationShell): AAS to convert
 
     Returns:
-        aas_model.AAS: Pydantic model of the asset administration shell
+        aas_model.AssetAdministrationShell: Pydantic model of the asset administration shell
     """
     dict_model_instantiation = get_initial_dict_for_model_instantiation(aas)
     aas_submodel_ids = [sm.get_identifier() for sm in aas.submodel]

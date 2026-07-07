@@ -8,10 +8,8 @@ from basyx.aas.model import AssetAdministrationShell, DictObjectStore, Submodel
 from pydantic import (
     AfterValidator,
     BaseModel,
-    BeforeValidator,
     Field,
     ValidationError,
-    field_validator,
     model_validator,
 )
 
@@ -33,28 +31,11 @@ Reference = TypeVar(
 
 
 class Referable(BaseModel):
-    """
-    Base class for all referable classes of the AAS meta model. A Referable is an object with a local id (id_short) and a description.
-
-    Args:
-        id_short (IdString): Local id of the object.
-        description (str): Description of the object. Defaults to None.
-    """
-
     id_short: AasIdString
     description: str = ""
 
 
 class Identifiable(Referable):
-    """
-    Base class for all identifiable classes in the AAS Meta model. An Identifiable is a Referable with a global id (id_).
-
-    Args:
-        id (str): Global id of the object.
-        id_short (str): Local id of the object.
-        description (str, optional): Description of the object. Defaults to None.
-    """
-
     id: AasIdString
 
     @model_validator(mode="before")
@@ -77,7 +58,8 @@ class Identifiable(Referable):
 
 class Qualifier(BaseModel):
     """AAS Qualifier — named constraint with optional semantic reference."""
-    type_: str = Field(validation_alias="type")
+    model_config = {"populate_by_name": True}
+    type_: str = Field(alias="type")
     value: str
     value_type: str = "xs:string"
     semantic_id: str = ""
@@ -85,25 +67,12 @@ class Qualifier(BaseModel):
 
 
 class HasSemantics(BaseModel):
-    """
-    Base class for all classes that have semantics of the AAS meta model.
-    """
-
     semantic_id: str = ""
     supplemental_semantic_ids: List[str] = []
     qualifiers: List[Qualifier] = []
 
 
 class AAS(Identifiable):
-    """
-    Base class for all Asset Administration Shells (AAS).
-
-    Args:
-        id (str): Global id of the object.
-        id_short (str): Local id of the object.
-        description (str, optional): Description of the object. Defaults to None.
-    """
-
     @model_validator(mode="before")
     @classmethod
     def set_optional_fields_to_None(cls, data):
@@ -132,9 +101,7 @@ class AAS(Identifiable):
             try:
                 Submodel.model_validate(getattr(self, field_name))
             except ValidationError:
-                assert (
-                    False
-                ), f"All attributes of an AAS must be of type Submodel or inherit from Submodel"
+                assert False, f"All attributes of an AAS must be of type Submodel"
         return self
 
 
@@ -145,67 +112,102 @@ def is_valid_submodel_element(submodel_element: Any) -> bool:
         return True
     elif isinstance(submodel_element, SubmodelElementCollection):
         return True
-    elif (
-        isinstance(submodel_element, list)
-        or isinstance(submodel_element, tuple)
-        or isinstance(submodel_element, set)
-    ):
-        return all(is_valid_submodel_element(element) for element in submodel_element)
-    elif isinstance(submodel_element, Operation):
-        return True
-    elif isinstance(submodel_element, Capability):
-        return True
-    elif isinstance(submodel_element, File):
-        return True
-    elif isinstance(submodel_element, Blob):
+    elif isinstance(submodel_element, (list, tuple, set)):
+        return all(is_valid_submodel_element(e) for e in submodel_element)
+    elif isinstance(submodel_element, (Operation, Capability, Property,
+            MultiLanguageProperty, Range, ReferenceElement,
+            RelationshipElement, File, Blob)):
         return True
     try:
         SubmodelElementCollection.model_validate(submodel_element)
         return True
-    except:
+    except Exception:
         return False
 
 
 class SubmodelElementCollection(HasSemantics, Referable):
-    """
-    Base class for all submodel element collections.
-
-    Args:
-        id_short (str): Local id of the object.
-        description (str, optional): Description of the object. Defaults to None.
-        semantic_id (str, optional): Semantic id of the object. Defaults to None.
-    """
-
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         for field_name in self.model_fields:
-            if field_name in ["id", "id_short", "description", "semantic_id", "qualifiers", "supplemental_semantic_ids"]:
+            if field_name in ["id", "id_short", "description",
+                              "semantic_id", "qualifiers",
+                              "supplemental_semantic_ids"]:
                 continue
-            assert is_valid_submodel_element(
-                getattr(self, field_name)
-            ), f"All attributes of a SubmodelElementCollection must be valid SubmodelElements. Field {field_name} is not valid."
+            assert is_valid_submodel_element(getattr(self, field_name)), \
+                f"Field {field_name} is not a valid SubmodelElement"
         return self
 
 
 class Operation(HasSemantics, Referable):
-    id_short: AasIdString = "Operation"  # overridable default
+    id_short: AasIdString = "Operation"
     input_variables: List[SubmodelElement] = []
     output_variables: List[SubmodelElement] = []
     inoutput_variables: List[SubmodelElement] = []
 
 
 class Capability(HasSemantics, Referable):
-    """AAS Capability element — marker with no value, just id_short + semantic_id."""
-    id_short: AasIdString = "Capability"  # overridable default
+    id_short: AasIdString = "Capability"
+
+
+class Property(HasSemantics, Referable):
+    id_short: AasIdString = "Property"
+    value: str = ""
+    value_type: str = "xs:string"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_str(cls, data):
+        if isinstance(data, str):
+            return {"value": data}
+        return data
+
+
+class MultiLanguageProperty(HasSemantics, Referable):
+    id_short: AasIdString = "MultiLanguageProperty"
+    value: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_str(cls, data):
+        if isinstance(data, str):
+            return {"value": data}
+        return data
+
+
+class Range(HasSemantics, Referable):
+    id_short: AasIdString = "Range"
+    min_: str = ""
+    max_: str = ""
+    value_type: str = "xs:string"
+
+
+class ReferenceElement(HasSemantics, Referable):
+    id_short: AasIdString = "ReferenceElement"
+    value: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_str(cls, data):
+        if isinstance(data, str):
+            return {"value": data}
+        return data
+
+
+class RelationshipElement(HasSemantics, Referable):
+    id_short: AasIdString = "RelationshipElement"
+    first: str = ""
+    second: str = ""
 
 
 class File(HasSemantics, Referable):
-    media_type: str
-    path: str
+    id_short: AasIdString = "File"
+    media_type: str = ""
+    path: str = ""
 
 
 class Blob(HasSemantics, Referable):
-    media_type: str
+    id_short: AasIdString = "Blob"
+    media_type: str = ""
     content: Optional[bytes] = None
 
 
@@ -214,30 +216,21 @@ SubmodelElement = (
     PrimitiveSubmodelElement
     | SubmodelElementCollection
     | List["SubmodelElement"]
-    | Operation
-    | Capability
-    | Blob
-    | File
+    | Operation | Capability
+    | Property | MultiLanguageProperty | Range
+    | ReferenceElement | RelationshipElement
+    | Blob | File
 )
 
 
 class Submodel(HasSemantics, Identifiable):
-    """
-    Base class for all submodels.
-
-    Args:
-        id (str): Global id of the object.
-        id_short (str): Local id of the object.
-        description (str, optional): Description of the object. Defaults to None.
-        semantic_id (str, optional): Semantic id of the object. Defaults to None.
-    """
-
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         for field_name in self.model_fields:
-            if field_name in ["id", "id_short", "description", "semantic_id", "qualifiers", "supplemental_semantic_ids"]:
+            if field_name in ["id", "id_short", "description",
+                              "semantic_id", "qualifiers",
+                              "supplemental_semantic_ids"]:
                 continue
-            assert is_valid_submodel_element(
-                getattr(self, field_name)
-            ), f"All attributes of a Submodel must be valid SubmodelElements."
+            assert is_valid_submodel_element(getattr(self, field_name)), \
+                f"Field {field_name} is not a valid SubmodelElement"
         return self

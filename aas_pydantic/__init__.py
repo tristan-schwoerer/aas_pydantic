@@ -1,4 +1,8 @@
-from aas_pydantic.aas_model import AAS, Capability, Operation, Qualifier, Submodel, SubmodelElementCollection, Reference
+from aas_pydantic.aas_model import (
+    AAS, Blob, Capability, File, MultiLanguageProperty, Operation,
+    Property, Qualifier, Range, ReferenceElement, RelationshipElement,
+    Submodel, SubmodelElementCollection, Reference,
+)
 from aas_pydantic.convert_aas_instance import (
     convert_object_store_to_pydantic_models,
     convert_aas_to_pydantic_model_instance,

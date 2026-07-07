@@ -1,8 +1,13 @@
 """ControlComponentInstance — generated from IDTA template."""
 
+from __future__ import annotations
+
 from typing import ClassVar, List, Optional
 from pydantic import Field
-from aas_pydantic import Submodel, SubmodelElementCollection, Capability, Qualifier
+from aas_pydantic import (
+    Submodel, SubmodelElementCollection, Capability, Qualifier,
+    File, MultiLanguageProperty, Property, Range, ReferenceElement, RelationshipElement,
+)
 
 class Endpoint(SubmodelElementCollection):
     semantic_id: str = "https://admin-shell.io/idta/ControlComponent/Instance/Endpoint/2/0"
@@ -13,8 +18,20 @@ class Endpoint(SubmodelElementCollection):
         Qualifier(type_="EditDescription", value="True"),
     ]
 
-    interface_reference: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Instance/Endpoint/InterfaceReference/2/0", "description": "A reference to an interface description (SMC Interface) in a Control Component Type submodel that specifies the semantics of the interface.", "qualifiers": [{"type": "SMT/Cardinality", "value": "One", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}]}})
-    endpoint_reference: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Instance/Endpoint/Reference/2/0", "description": "A reference to a technical control endpoint that adheres to the semantics of the referenced interface.", "qualifiers": [{"type": "SMT/Cardinality", "value": "One", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}]}})
+    interface_reference: ReferenceElement = ReferenceElement(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Instance/Endpoint/InterfaceReference/2/0",
+        description="A reference to an interface description (SMC Interface) in a Control Component Type submodel that specifies the semantics of the interface.",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+        ],
+    )
+    endpoint_reference: ReferenceElement = ReferenceElement(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Instance/Endpoint/Reference/2/0",
+        description="A reference to a technical control endpoint that adheres to the semantics of the referenced interface.",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+        ],
+    )
 
 class Endpoints(SubmodelElementCollection):
     semantic_id: str = "https://admin-shell.io/idta/ControlComponent/Instance/Endpoints/2/0"
@@ -32,7 +49,14 @@ class Modes(SubmodelElementCollection):
         Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
     ]
 
-    mode__00__: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Skill/Mode/2/0", "description": "Name of the operation, operating, operational or execution modes (depending on the standard), in which the skill is available/allowed to execute.", "qualifiers": [{"type": "PresetIdShort", "value": "To be filled; normally same as idShort, might be with {00}"}, {"type": "SMT/Cardinality", "value": "OneToMany", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}]}})
+    mode__00__: Property = Property(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Skill/Mode/2/0",
+        description="Name of the operation, operating, operational or execution modes (depending on the standard), in which the skill is available/allowed to execute.",
+        qualifiers=[
+            Qualifier(type_="PresetIdShort", value="To be filled; normally same as idShort, might be with {00}"),
+            Qualifier(type_="SMT/Cardinality", value="OneToMany", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+        ],
+    )
 
 class Values(SubmodelElementCollection):
     semantic_id: str = "https://admin-shell.io/idta/ControlComponent/Skill/Parameter/Values/2/0"
@@ -53,8 +77,21 @@ class Parameter(SubmodelElementCollection):
         Qualifier(type_="PresetIdShort", value="To be filled; normally same as idShort, might be with {00}"),
     ]
 
-    direction: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Skill/Parameter/Direction/2/0", "description": "Indicates whether the parameter is an input (In) or an output (Out) of the skill. An InOut parameter can be set from outside and can also be changed from skill itself. ", "qualifiers": [{"type": "SMT/Cardinality", "value": "One", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}, {"type": "FormChoices", "value": "In;Out;InOut"}]}})
-    type: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Skill/Parameter/Type/2/0", "description": "Data type as string used to interpret the parameter. ", "qualifiers": [{"type": "SMT/Cardinality", "value": "One", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}]}})
+    direction: Property = Property(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Skill/Parameter/Direction/2/0",
+        description="Indicates whether the parameter is an input (In) or an output (Out) of the skill. An InOut parameter can be set from outside and can also be changed from skill itself. ",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+            Qualifier(type_="FormChoices", value="In;Out;InOut"),
+        ],
+    )
+    type_: Property = Property(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Skill/Parameter/Type/2/0",
+        description="Data type as string used to interpret the parameter. ",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+        ],
+    )
     values: Optional[Values] = None
 
 class Parameters(SubmodelElementCollection):
@@ -73,7 +110,15 @@ class Errors(SubmodelElementCollection):
         Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
     ]
 
-    error_reference__00__: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Skill/ErrorReference/2/0", "qualifiers": [{"type": "SMT/Cardinality", "value": "ZeroToMany", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}, {"type": "EditIdShort", "value": "True"}, {"type": "EditDescription", "value": "True"}, {"type": "PresetIdShort", "value": "To be filled; normally same as idShort, might be with {00}"}]}})
+    error_reference__00__: ReferenceElement = ReferenceElement(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Skill/ErrorReference/2/0",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="ZeroToMany", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+            Qualifier(type_="EditIdShort", value="True"),
+            Qualifier(type_="EditDescription", value="True"),
+            Qualifier(type_="PresetIdShort", value="To be filled; normally same as idShort, might be with {00}"),
+        ],
+    )
 
 class Uses(SubmodelElementCollection):
     semantic_id: str = "https://admin-shell.io/idta/ControlComponent/Skill/Uses/2/0"
@@ -82,7 +127,15 @@ class Uses(SubmodelElementCollection):
         Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
     ]
 
-    skill_reference__00__: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Skill/SkillReference/2/0", "qualifiers": [{"type": "SMT/Cardinality", "value": "ZeroToMany", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}, {"type": "EditIdShort", "value": "True"}, {"type": "EditDescription", "value": "True"}, {"type": "PresetIdShort", "value": "To be filled; normally same as idShort, might be with {00}"}]}})
+    skill_reference__00__: ReferenceElement = ReferenceElement(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Skill/SkillReference/2/0",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="ZeroToMany", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+            Qualifier(type_="EditIdShort", value="True"),
+            Qualifier(type_="EditDescription", value="True"),
+            Qualifier(type_="PresetIdShort", value="To be filled; normally same as idShort, might be with {00}"),
+        ],
+    )
 
 class Skill(SubmodelElementCollection):
     semantic_id: str = "https://admin-shell.io/idta/ControlComponent/Skill/2/0"
@@ -94,7 +147,14 @@ class Skill(SubmodelElementCollection):
         Qualifier(type_="PresetIdShort", value="To be filled; normally same as idShort, might be with {00}"),
     ]
 
-    disabled: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Skill/Disabled/2/0", "description": "Boolean property that defines if the skill is (currently) disabled, e.g. not licensed, tested, suitable.", "qualifiers": [{"type": "SMT/Cardinality", "value": "One", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}, {"type": "FormChoices", "value": "true;false"}]}})
+    disabled: Property = Property(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Skill/Disabled/2/0",
+        description="Boolean property that defines if the skill is (currently) disabled, e.g. not licensed, tested, suitable.",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+            Qualifier(type_="FormChoices", value="true;false"),
+        ],
+    )
     modes: Optional[Modes] = None
     parameters: Optional[Parameters] = None
     errors: Optional[Errors] = None
@@ -123,4 +183,10 @@ class ControlComponentInstance(Submodel):
 
     endpoints: Optional[Endpoints] = None
     skills: Optional[Skills] = None
-    type: str = Field("", json_schema_extra={"aas": {"semantic_id": "https://admin-shell.io/idta/ControlComponent/Instance/Type/2/0", "description": "Reference between the component instance and its respective ControlComponentType Submodel.", "qualifiers": [{"type": "SMT/Cardinality", "value": "One", "semantic_id": "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"}]}})
+    type_: ReferenceElement = ReferenceElement(
+        semantic_id="https://admin-shell.io/idta/ControlComponent/Instance/Type/2/0",
+        description="Reference between the component instance and its respective ControlComponentType Submodel.",
+        qualifiers=[
+            Qualifier(type_="SMT/Cardinality", value="One", semantic_id="https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"),
+        ],
+    )

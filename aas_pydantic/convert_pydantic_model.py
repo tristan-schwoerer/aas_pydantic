@@ -7,6 +7,7 @@ import uuid
 
 
 from basyx.aas import model
+from basyx.aas.model import datatypes
 
 from typing import Optional, Union
 from aas_pydantic import convert_util, aas_model
@@ -203,6 +204,47 @@ def create_submodel_element(
     if isinstance(attribute_value, aas_model.Blob):
         return create_blob(attribute_value)
 
+    # ── Typed leaf models (metadata from instance, not field_info) ──
+    if isinstance(attribute_value, aas_model.ReferenceElement):
+        q, s, d = _model_metadata(attribute_value)
+        if not attribute_value.value:
+            return None
+        ref = model.ModelReference(
+            key=(model.Key(type_=model.KeyTypes.ASSET_ADMINISTRATION_SHELL, value=attribute_value.value),),
+            type_="")
+        return model.ReferenceElement(
+            id_short=attribute_name, value=ref,
+            semantic_id=sid or get_semantic_id(attribute_value),
+            qualifier=q, supplemental_semantic_id=s, description=d)
+
+    if isinstance(attribute_value, aas_model.Property):
+        q, s, d = _model_metadata(attribute_value)
+        vt_str = attribute_value.value_type
+        vt = getattr(datatypes, vt_str.split(":")[-1], datatypes.String) if ":" in vt_str else datatypes.String
+        return model.Property(
+            id_short=attribute_name, value=attribute_value.value,
+            value_type=vt,
+            semantic_id=sid or get_semantic_id(attribute_value),
+            qualifier=q, supplemental_semantic_id=s, description=d)
+
+    if isinstance(attribute_value, aas_model.MultiLanguageProperty):
+        q, s, d = _model_metadata(attribute_value)
+        return model.MultiLanguageProperty(
+            id_short=attribute_name, value=attribute_value.value,
+            semantic_id=sid or get_semantic_id(attribute_value),
+            qualifier=q, supplemental_semantic_id=s, description=d)
+
+    if isinstance(attribute_value, aas_model.RelationshipElement):
+        q, s, d = _model_metadata(attribute_value)
+        if not attribute_value.first or not attribute_value.second:
+            return None
+        return model.RelationshipElement(
+            id_short=attribute_name,
+            first=model.ModelReference(key=(model.Key(type_=model.KeyTypes.GLOBAL_REFERENCE, value=attribute_value.first),), type_=""),
+            second=model.ModelReference(key=(model.Key(type_=model.KeyTypes.GLOBAL_REFERENCE, value=attribute_value.second),), type_=""),
+            semantic_id=sid or get_semantic_id(attribute_value),
+            qualifier=q, supplemental_semantic_id=s, description=d)
+
     prop = create_property(attribute_name, attribute_value)
     if sid: prop.semantic_id = sid
     if quals: prop.qualifier = quals
@@ -359,20 +401,14 @@ def create_submodel_element_list(
     return sml
 
 
-def create_file(attribute_value: aas_model.File) -> model.File:
-    """
-    Function generates a basyx file objects from a pydantic File.
-
-    Args:
-        attribute_value (aas_model.File): pydantic File instance.
-
-    Returns:
-        model.File: Basyx file.
-    """
+def create_file(attribute_value: aas_model.File) -> Optional[model.File]:
+    """Generate a basyx File. Returns None if path or media_type is empty."""
+    if not attribute_value.path or not attribute_value.media_type:
+        return None
     return model.File(
         id_short=attribute_value.id_short,
         description=attribute_value.description,
-        semantic_id=attribute_value.semantic_id,
+        semantic_id=get_semantic_id(attribute_value),
         content_type=attribute_value.media_type,
         value=attribute_value.path,
     )

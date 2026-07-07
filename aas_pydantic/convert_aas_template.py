@@ -19,7 +19,7 @@ from aas_pydantic.convert_util import (
 )
 def convert_object_store_to_pydantic_types(
     obj_store: model.DictObjectStore,
-) -> typing.List[type[aas_model.AAS]]:
+) -> typing.List[type[aas_model.AssetAdministrationShell]]:
     """
     Converts an object store with AAS and submodels to pydantic models, representing the original data structure.
 
@@ -27,7 +27,7 @@ def convert_object_store_to_pydantic_types(
         obj_store (model.DictObjectStore): Object store with AAS and submodels
 
     Returns:
-        typing.List[aas_model.AAS]: List of pydantic models
+        typing.List[aas_model.AssetAdministrationShell]: List of pydantic models
     """
     pydantic_submodel_types: typing.List[aas_model.Submodel] = []
     submodels_pydantic_type_mapping = {}
@@ -40,7 +40,7 @@ def convert_object_store_to_pydantic_types(
                 identifiable,
             )
 
-    pydantic_aas_list: typing.List[type[aas_model.AAS]] = []
+    pydantic_aas_list: typing.List[type[aas_model.AssetAdministrationShell]] = []
     for identifiable in obj_store:
         if isinstance(identifiable, model.AssetAdministrationShell):
             pydantic_aas = convert_aas_to_pydantic_type(
@@ -56,7 +56,7 @@ def convert_aas_to_pydantic_type(
     pydantic_submodel_types: typing.Dict[
         str, typing.Tuple[type[aas_model.Submodel], model.Submodel]
     ],
-) -> type[aas_model.AAS]:
+) -> type[aas_model.AssetAdministrationShell]:
     """
     Converts an AAS to a Pydantic model.
 
@@ -64,7 +64,7 @@ def convert_aas_to_pydantic_type(
         aas (model.AssetAdministrationShell): AAS to convert
 
     Returns:
-        aas_model.AAS: Pydantic model of the asset administration shell
+        aas_model.AssetAdministrationShell: Pydantic model of the asset administration shell
     """
     aas_class_name = convert_util.get_class_name_from_basyx_template(aas)
     dict_dynamic_model_creation = get_initial_dict_for_dynamic_model_creation(aas)
@@ -97,7 +97,7 @@ def convert_aas_to_pydantic_type(
                 {attribute_name: typing.Annotated[attribute_type, Field(examples=[])]}
             )
     model_type = create_model(
-        aas_class_name, **dict_dynamic_model_creation, __base__=aas_model.AAS
+        aas_class_name, **dict_dynamic_model_creation, __base__=aas_model.AssetAdministrationShell
     )
     return model_type
 
