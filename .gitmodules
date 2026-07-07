@@ -1,3 +1,6 @@
 [submodule "submodel-templates"]
 	path = submodel-templates
 	url = https://github.com/admin-shell-io/submodel-templates.git
+[submodule "aas-specs"]
+	path = aas-specs
+	url = https://github.com/admin-shell-io/aas-specs.git
