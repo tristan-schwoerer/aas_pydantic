@@ -75,6 +75,15 @@ class Identifiable(Referable):
         return data
 
 
+class Qualifier(BaseModel):
+    """AAS Qualifier — named constraint with optional semantic reference."""
+    type_: str = Field(validation_alias="type")
+    value: str
+    value_type: str = "xs:string"
+    semantic_id: str = ""
+    kind: str = "TemplateQualifier"
+
+
 class HasSemantics(BaseModel):
     """
     Base class for all classes that have semantics of the AAS meta model.
@@ -82,7 +91,7 @@ class HasSemantics(BaseModel):
 
     semantic_id: str = ""
     supplemental_semantic_ids: List[str] = []
-    qualifiers: List[dict] = []
+    qualifiers: List[Qualifier] = []
 
 
 class AAS(Identifiable):

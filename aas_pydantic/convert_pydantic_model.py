@@ -408,14 +408,27 @@ def _make_external_reference(uri: str) -> model.ExternalReference:
 def _make_qualifiers(qds: list) -> list:
     result = []
     for qd in qds:
-        kwargs = {
-            "type_": qd["type"],
-            "value_type": model.datatypes.String,
-            "value": qd["value"],
-            "kind": model.QualifierKind.TEMPLATE_QUALIFIER,
-        }
-        if "semantic_id" in qd:
-            kwargs["semantic_id"] = _make_external_reference(qd["semantic_id"])
+        # Handle both Qualifier model instances and raw dicts (from json_schema_extra)
+        if hasattr(qd, 'type_'):
+            # Qualifier model instance
+            kwargs = {
+                "type_": qd.type_,
+                "value_type": model.datatypes.String,
+                "value": qd.value,
+                "kind": model.QualifierKind.TEMPLATE_QUALIFIER,
+            }
+            if qd.semantic_id:
+                kwargs["semantic_id"] = _make_external_reference(qd.semantic_id)
+        else:
+            # Raw dict from json_schema_extra
+            kwargs = {
+                "type_": qd["type"],
+                "value_type": model.datatypes.String,
+                "value": qd["value"],
+                "kind": model.QualifierKind.TEMPLATE_QUALIFIER,
+            }
+            if "semantic_id" in qd and qd["semantic_id"]:
+                kwargs["semantic_id"] = _make_external_reference(qd["semantic_id"])
         result.append(model.Qualifier(**kwargs))
     return result
 

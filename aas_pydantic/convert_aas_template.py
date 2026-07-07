@@ -17,8 +17,6 @@ from aas_pydantic.convert_util import (
     repatch_id_short_to_temp_attribute,
     unpatch_id_short_from_temp_attribute,
 )
-
-
 def convert_object_store_to_pydantic_types(
     obj_store: model.DictObjectStore,
 ) -> typing.List[type[aas_model.AAS]]:
