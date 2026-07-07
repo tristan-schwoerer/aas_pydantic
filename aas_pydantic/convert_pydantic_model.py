@@ -150,8 +150,7 @@ def create_submodel_element(
     desc = model.MultiLanguageTextType({"en": aas_meta["description"]}) if aas_meta.get("description") else None
 
     if isinstance(attribute_value, aas_model.SubmodelElementCollection):
-        smc = create_submodel_element_collection(attribute_value, field_info)
-        if sid: smc.semantic_id = sid
+        smc = create_submodel_element_collection(attribute_value)
         if quals: smc.qualifier = quals
         if suppl: smc.supplemental_semantic_id = suppl
         if desc: smc.description = desc
@@ -211,7 +210,6 @@ def create_property(
 
 def create_submodel_element_collection(
     model_sec: aas_model.SubmodelElementCollection,
-    parent_field_info=None,  # Optional[FieldInfo] — for AAS metadata on the SMC itself
 ) -> model.SubmodelElementCollection:
     value = []
     smc_attributes = get_attribute_infos(model_sec)
@@ -249,15 +247,6 @@ def create_submodel_element_collection(
 
     id_short = get_id_short(model_sec)
 
-    # Read AAS metadata from parent field (for semantic_id/qualifiers on the SMC itself)
-    aas_meta = get_aas_meta(parent_field_info) if parent_field_info else {}
-    smc_sid = (_make_external_reference(aas_meta["semantic_id"])
-               if aas_meta.get("semantic_id") else get_semantic_id(model_sec))
-    smc_quals = (_make_qualifiers(aas_meta.get("qualifiers", []))
-                 if aas_meta.get("qualifiers") else [])
-    smc_suppl = ([_make_external_reference(s) for s in aas_meta.get("supplemental_semantic_ids", [])]
-                 if aas_meta.get("supplemental_semantic_ids") else [])
-
     smc = model.SubmodelElementCollection(
         id_short=id_short,
         value=value,
@@ -266,9 +255,7 @@ def create_submodel_element_collection(
             model_sec
         )
         + submodel_element_data_specifications,
-        semantic_id=smc_sid,
-        qualifier=smc_quals,
-        supplemental_semantic_id=smc_suppl,
+        semantic_id=get_semantic_id(model_sec),
     )
     return smc
 
