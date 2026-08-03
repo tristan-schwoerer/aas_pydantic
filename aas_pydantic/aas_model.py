@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import NoneType
-from typing import Annotated, Any, List, Optional, TypeVar, Union
+from typing import Annotated, Any, List, Optional, TypeVar, Union, Literal
 import typing
 
 from basyx.aas.model import AssetAdministrationShell, DictObjectStore, Submodel
@@ -65,6 +65,11 @@ class Qualifier(BaseModel):
     semantic_id: str = ""
     kind: str = "TemplateQualifier"
 
+class Cardinality(Qualifier):
+    type_: str = "SMT/Cardinality"
+    value: Literal["ZeroToOne", "ZeroToMany", "One", "OneToMany"] = "One"
+    semantic_id: str = "https://admin-shell.io/SubmodelTemplates/Cardinality/1/0"
+
 
 class HasSemantics(BaseModel):
     semantic_id: str = ""
@@ -73,6 +78,11 @@ class HasSemantics(BaseModel):
 
 
 class AAS(Identifiable):
+    # AAS-level metadata (not submodels — excluded from check_submodels)
+    asset_type: str = ""
+    derived_from: str = ""
+    specific_asset_ids: dict[str, str] = {}
+
     @model_validator(mode="before")
     @classmethod
     def set_optional_fields_to_None(cls, data):
@@ -89,8 +99,9 @@ class AAS(Identifiable):
 
     @model_validator(mode="after")
     def check_submodels(self) -> Any:
+        _meta = {"id", "id_short", "description", "asset_type", "derived_from", "specific_asset_ids"}
         for field_name, field_info in self.model_fields.items():
-            if field_name in ["id", "id_short", "description"]:
+            if field_name in _meta:
                 continue
             elif (
                 typing.get_origin(field_info.annotation) == Union
@@ -101,35 +112,41 @@ class AAS(Identifiable):
             try:
                 Submodel.model_validate(getattr(self, field_name))
             except ValidationError:
-                assert False, f"All attributes of an AAS must be of type Submodel"
+                assert False, f"Field '{field_name}' must be of type Submodel"
         return self
 
 
 def is_valid_submodel_element(submodel_element: Any) -> bool:
     if isinstance(submodel_element, NoneType):
         return True
-    if isinstance(submodel_element, PrimitiveSubmodelElement):
-        return True
-    elif isinstance(submodel_element, SubmodelElementCollection):
+    if isinstance(submodel_element, SubmodelElement):
         return True
     elif isinstance(submodel_element, (list, tuple, set)):
         return all(is_valid_submodel_element(e) for e in submodel_element)
-    elif isinstance(submodel_element, (Operation, Capability, Property,
-            MultiLanguageProperty, Range, ReferenceElement,
-            RelationshipElement, File, Blob)):
-        return True
+    elif isinstance(submodel_element, dict):
+        return all(is_valid_submodel_element(v) for v in submodel_element.values())
     try:
-        SubmodelElementCollection.model_validate(submodel_element)
+        SubmodelElement.model_validate(submodel_element)
         return True
     except Exception:
         return False
 
 
-class SubmodelElementCollection(HasSemantics, Referable):
+class SubmodelElement(HasSemantics, Referable):
+    """Abstract base for all AAS SubmodelElements.
+
+    Every SubmodelElement carries an id_short (from Referable) and
+    optional semantic_id / qualifiers (from HasSemantics).  Concrete
+    types — Property, Range, SMC, SML, Entity, etc. — inherit from here.
+    """
+    pass
+
+
+class SubmodelElementCollection(SubmodelElement):
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         for field_name in self.model_fields:
-            if field_name in ["id", "id_short", "description",
+            if field_name in ["id_short", "description",
                               "semantic_id", "qualifiers",
                               "supplemental_semantic_ids"]:
                 continue
@@ -138,89 +155,102 @@ class SubmodelElementCollection(HasSemantics, Referable):
         return self
 
 
-class Operation(HasSemantics, Referable):
+class SubmodelElementList(SubmodelElement):
+    """Pydantic model for an AAS SubmodelElementList.
+
+    Wraps an ordered list of submodel elements with list-level AAS metadata
+    (semantic_id, description, qualifiers).  The ``value`` field holds the
+    actual list items.
+    """
+    value: List[Any] = []
+
+    @model_validator(mode="after")
+    def check_submodel_elements(self) -> Any:
+        for field_name in self.model_fields:
+            if field_name in ["id_short", "description",
+                              "semantic_id", "qualifiers",
+                              "supplemental_semantic_ids"]:
+                continue
+            assert is_valid_submodel_element(getattr(self, field_name)), \
+                f"Field {field_name} is not a valid SubmodelElement"
+        return self
+
+
+class Entity(SubmodelElement):
+    """Pydantic model for an AAS Entity.
+
+    An Entity is a SubmodelElement that represents a structured collection
+    of statements.  It carries an ``entity_type`` (SelfManagedEntity or
+    CoManagedEntity) and its child elements as model fields (like an SMC).
+    """
+    entity_type: str = ""
+
+    @model_validator(mode="after")
+    def check_submodel_elements(self) -> Any:
+        for field_name in self.model_fields:
+            if field_name in ["id_short", "description",
+                              "semantic_id", "qualifiers",
+                              "supplemental_semantic_ids", "entity_type"]:
+                continue
+            assert is_valid_submodel_element(getattr(self, field_name)), \
+                f"Field {field_name} is not a valid SubmodelElement"
+        return self
+
+
+class Operation(SubmodelElement):
     id_short: AasIdString = "Operation"
     input_variables: List[SubmodelElement] = []
     output_variables: List[SubmodelElement] = []
     inoutput_variables: List[SubmodelElement] = []
 
 
-class Capability(HasSemantics, Referable):
+class Capability(SubmodelElement):
     id_short: AasIdString = "Capability"
 
 
-class Property(HasSemantics, Referable):
+class Property(SubmodelElement):
     id_short: AasIdString = "Property"
     value: str = ""
     value_type: str = "xs:string"
 
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_str(cls, data):
-        if isinstance(data, str):
-            return {"value": data}
-        return data
 
-
-class MultiLanguageProperty(HasSemantics, Referable):
+class MultiLanguageProperty(SubmodelElement):
     id_short: AasIdString = "MultiLanguageProperty"
+    language: str = "en"
     value: str = ""
 
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_str(cls, data):
-        if isinstance(data, str):
-            return {"value": data}
-        return data
 
-
-class Range(HasSemantics, Referable):
+class Range(SubmodelElement):
     id_short: AasIdString = "Range"
-    min_: str = ""
-    max_: str = ""
+    min_: str | int | float = ""
+    max_: str | int | float = ""
     value_type: str = "xs:string"
 
 
-class ReferenceElement(HasSemantics, Referable):
+class ReferenceElement(SubmodelElement):
     id_short: AasIdString = "ReferenceElement"
     value: str = ""
 
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_str(cls, data):
-        if isinstance(data, str):
-            return {"value": data}
-        return data
 
-
-class RelationshipElement(HasSemantics, Referable):
+class RelationshipElement(SubmodelElement):
     id_short: AasIdString = "RelationshipElement"
     first: str = ""
     second: str = ""
 
 
-class File(HasSemantics, Referable):
+class File(SubmodelElement):
     id_short: AasIdString = "File"
     media_type: str = ""
     path: str = ""
 
 
-class Blob(HasSemantics, Referable):
+class Blob(SubmodelElement):
     id_short: AasIdString = "Blob"
     media_type: str = ""
     content: Optional[bytes] = None
 
 
 PrimitiveSubmodelElement = int | float | str | bool | bytes
-SubmodelElement = (
-    PrimitiveSubmodelElement
-    | SubmodelElementCollection
-    | List["SubmodelElement"]
-    | Operation | Capability
-    | Property | MultiLanguageProperty | Range
-    | ReferenceElement | RelationshipElement
-    | Blob | File
-)
 
 
 class Submodel(HasSemantics, Identifiable):
