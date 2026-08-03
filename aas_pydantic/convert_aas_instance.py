@@ -252,6 +252,12 @@ def get_type_of_attribute(
     """
     Returns the type of an attribute of a Pydantic model.
 
+    Tries ``attribute_name`` first, then ``{attribute_name}_ref`` as a fallback.
+    The ``_ref`` suffix is used by idta_generate.py to work around a Pydantic
+    v2.13.4 bug where circular ``Dict[str, X]`` schema generation crashes when
+    a back-reference field name collides with the class holding the Dict
+    (e.g. ``properties: Optional['properties']`` → renamed to ``properties_ref``).
+
     Args:
         model_type (typing.Union[type[BaseModel], typing.Union]): Pydantic model type to get the attribute type from.
         attribute_name (str): Name of the attribute to get the type from.
@@ -259,18 +265,23 @@ def get_type_of_attribute(
     Returns:
         typing.Union[type[BaseModel], typing.Union]: Type of the attribute.
     """
+    def _find_field(mt, name):
+        if hasattr(mt, "model_fields") and name in mt.model_fields:
+            return mt.model_fields[name].annotation
+        # _ref fallback: Pydantic circular Dict bug workaround (idta_generate.py)
+        ref_name = f"{name}_ref"
+        if hasattr(mt, "model_fields") and ref_name in mt.model_fields:
+            return mt.model_fields[ref_name].annotation
+        return None
+
     if typing.get_origin(model_type) is typing.Union:
         for contained_type in typing.get_args(model_type):
-            if (
-                hasattr(contained_type, "model_fields")
-                and attribute_name in contained_type.model_fields
-            ):
-                return contained_type.model_fields[attribute_name].annotation
-    if (
-        hasattr(model_type, "model_fields")
-        and attribute_name in model_type.model_fields
-    ):
-        return model_type.model_fields[attribute_name].annotation
+            result = _find_field(contained_type, attribute_name)
+            if result is not None:
+                return result
+    result = _find_field(model_type, attribute_name)
+    if result is not None:
+        return result
     raise ValueError(
         f"Attribute {attribute_name} not found in model fields with attributes {list(model_type.model_fields.keys())}."
     )

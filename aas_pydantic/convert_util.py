@@ -411,6 +411,18 @@ def get_default_data_specification_for_attribute(
     # Avoid IEC61360 crash on empty/falsy defaults
     if default_val is None or default_val == "" or default_val == 0:
         return None
+    # Convert model instances to a meaningful string (not Python repr)
+    if isinstance(default_val, aas_model.Referable):
+        default_str = default_val.id_short
+    elif isinstance(default_val, (list, tuple, set)):
+        default_str = ", ".join(
+            getattr(v, 'id_short', str(v)) for v in default_val
+        )
+    else:
+        default_str = str(default_val)
+    # Some defaults have empty id_short or produce empty strings — skip those
+    if not default_str or not default_str.strip():
+        return None
     model_keys = get_model_keys_for_data_specification(basyx_attribute)
     return model.EmbeddedDataSpecification(
         data_specification=model.ExternalReference(
@@ -418,7 +430,7 @@ def get_default_data_specification_for_attribute(
         ),
         data_specification_content=model.DataSpecificationIEC61360(
             preferred_name=model.LangStringSet({"en": "default"}),
-            value=str(default_val),
+            value=default_str,
         ),
     )
 

@@ -8,6 +8,7 @@ import uuid
 
 from basyx.aas import model
 from basyx.aas.model import datatypes
+from basyx.aas.model.datatypes import XSD_TYPE_CLASSES, from_xsd
 
 from typing import Optional, Union
 from aas_pydantic import convert_util, aas_model
@@ -39,10 +40,13 @@ def convert_model_to_aas(
     Returns:
         model.DictObjectStore[model.Identifiable]: DictObjectStore with all Submodels
     """
+    _META = {"asset_type", "derived_from", "specific_asset_ids"}
     aas_attribute_infos = get_attribute_infos(model_aas)
     aas_submodels = {}
     aas_submodel_data_specifications = []
     for attribute_info in aas_attribute_infos:
+        if attribute_info.name in _META:
+            continue
         submodel = convert_model_to_submodel(model_submodel=attribute_info.value)
         attribute_data_specification = (
             convert_util.get_data_specification_for_attribute(attribute_info, submodel)
@@ -51,26 +55,49 @@ def convert_model_to_aas(
         if submodel and not submodel.id_short in aas_submodels:
             aas_submodels.update({submodel.id_short: submodel})
 
+    # ── AssetInformation with metadata from the Pydantic model ────────
+    asset_type = getattr(model_aas, "asset_type", "") or "Instance"
     asset_information = model.AssetInformation(
         global_asset_id=model.Identifier(model_aas.id),
         asset_kind=model.AssetKind.INSTANCE,
-        asset_type=model.Identifier("Instance"),
+        asset_type=model.Identifier(asset_type) if asset_type else None,
     )
 
-    basyx_aas = model.AssetAdministrationShell(
-        asset_information=asset_information,
-        id_short=get_id_short(model_aas),
-        id_=model.Identifier(model_aas.id),
-        description=convert_util.get_basyx_description_from_model(model_aas),
-        submodel={
+    # Specific asset IDs
+    specific_ids = getattr(model_aas, "specific_asset_ids", {}) or {}
+    if specific_ids:
+        sid_set = set()
+        for name, value in specific_ids.items():
+            sid_set.add(model.SpecificAssetId(
+                name=name, value=str(value),
+                external_subject_id=model.ExternalReference(key=(
+                    model.Key(model.KeyTypes.GLOBAL_REFERENCE,
+                              f"https://admin-shell.io/aas/3/0/SpecificAssetId/{name}"),))))
+        asset_information.specific_asset_id = sid_set
+
+    # Derived-from template
+    derived_from = getattr(model_aas, "derived_from", "") or ""
+
+    # ── Build AAS shell ────────────────────────────────────────────────────
+    aas_kwargs = {
+        "asset_information": asset_information,
+        "id_short": get_id_short(model_aas),
+        "id_": model.Identifier(model_aas.id),
+        "description": convert_util.get_basyx_description_from_model(model_aas),
+        "submodel": {
             model.ModelReference.from_referable(submodel)
             for submodel in aas_submodels.values()
         },
-        embedded_data_specifications=convert_util.get_data_specification_for_model(
+        "embedded_data_specifications": convert_util.get_data_specification_for_model(
             model_aas
-        )
-        + aas_submodel_data_specifications,
-    )
+        ) + aas_submodel_data_specifications,
+    }
+    if derived_from:
+        aas_kwargs["derived_from"] = model.ModelReference(
+            (model.Key(model.KeyTypes.ASSET_ADMINISTRATION_SHELL, derived_from),),
+            model.AssetAdministrationShell)
+
+    basyx_aas = model.AssetAdministrationShell(**aas_kwargs)
     obj_store: model.DictObjectStore[model.Identifiable] = model.DictObjectStore()
     obj_store.add(basyx_aas)
     for sm in aas_submodels.values():
@@ -92,9 +119,18 @@ def convert_model_to_submodel(
         # Skip metadata fields (not actual submodel elements)
         if attribute_info.name in ("qualifiers", "supplemental_semantic_ids"):
             continue
+
+        attr_value = attribute_info.value
+        # Dict[str, SMC] → inline entries as direct submodel elements
+        if isinstance(attr_value, dict):
+            submodel_elements.extend(
+                _inline_dict_children(attr_value, field_info=attribute_info.field_info)
+            )
+            continue
+
         # Pass field_info so create_submodel_element can read AAS metadata
         submodel_element = create_submodel_element(
-            attribute_info.name, attribute_info.value,
+            attribute_info.name, attr_value,
             field_info=attribute_info.field_info,
         )
         attribute_data_specification = (
@@ -168,6 +204,37 @@ def create_submodel_element(
     suppl = [_make_external_reference(s) for s in suppl_meta] if suppl_meta else []
     desc = model.MultiLanguageTextType({"en": desc_text}) if desc_text else None
 
+    if isinstance(attribute_value, aas_model.Entity):
+        smc = create_submodel_element_collection(attribute_value)
+        q, s, d = _model_metadata(attribute_value)
+        if q: smc.qualifier = q
+        if s: smc.supplemental_semantic_id = s
+        if d: smc.description = d
+        # Attach entity_type as a qualifier or extension
+        if attribute_value.entity_type:
+            et_qual = model.Qualifier(
+                type_="entityType",
+                value_type=model.datatypes.String,
+                value=attribute_value.entity_type,
+                kind=model.QualifierKind.TEMPLATE_QUALIFIER,
+            )
+            if smc.qualifier:
+                smc.qualifier = list(smc.qualifier) + [et_qual]
+            else:
+                smc.qualifier = [et_qual]
+        return smc
+
+    if isinstance(attribute_value, aas_model.SubmodelElementList):
+        sml = create_submodel_element_list(attribute_name, attribute_value.value, field_info)
+        q, s, d = _model_metadata(attribute_value)
+        sml_sid = get_semantic_id(attribute_value)
+        if sml_sid: sml.semantic_id = sml_sid
+        elif sid: sml.semantic_id = sid
+        if q: sml.qualifier = q
+        if s: sml.supplemental_semantic_id = s
+        if d: sml.description = d
+        return sml
+
     if isinstance(attribute_value, aas_model.SubmodelElementCollection):
         smc = create_submodel_element_collection(attribute_value)
         q, s, d = _model_metadata(attribute_value)
@@ -220,17 +287,20 @@ def create_submodel_element(
     if isinstance(attribute_value, aas_model.Property):
         q, s, d = _model_metadata(attribute_value)
         vt_str = attribute_value.value_type
-        vt = getattr(datatypes, vt_str.split(":")[-1], datatypes.String) if ":" in vt_str else datatypes.String
+        vt = XSD_TYPE_CLASSES.get(vt_str, datatypes.String)
+        value = from_xsd(attribute_value.value, vt) if vt is not datatypes.String else attribute_value.value
         return model.Property(
-            id_short=attribute_name, value=attribute_value.value,
+            id_short=attribute_name, value=value,
             value_type=vt,
             semantic_id=sid or get_semantic_id(attribute_value),
             qualifier=q, supplemental_semantic_id=s, description=d)
 
     if isinstance(attribute_value, aas_model.MultiLanguageProperty):
         q, s, d = _model_metadata(attribute_value)
+        lang = getattr(attribute_value, 'language', 'en') or 'en'
         return model.MultiLanguageProperty(
-            id_short=attribute_name, value=attribute_value.value,
+            id_short=attribute_name,
+            value=model.LangStringSet({lang: attribute_value.value}),
             semantic_id=sid or get_semantic_id(attribute_value),
             qualifier=q, supplemental_semantic_id=s, description=d)
 
@@ -242,6 +312,32 @@ def create_submodel_element(
             id_short=attribute_name,
             first=model.ModelReference(key=(model.Key(type_=model.KeyTypes.GLOBAL_REFERENCE, value=attribute_value.first),), type_=""),
             second=model.ModelReference(key=(model.Key(type_=model.KeyTypes.GLOBAL_REFERENCE, value=attribute_value.second),), type_=""),
+            semantic_id=sid or get_semantic_id(attribute_value),
+            qualifier=q, supplemental_semantic_id=s, description=d)
+
+    if isinstance(attribute_value, aas_model.Range):
+        q, s, d = _model_metadata(attribute_value)
+        vt_str = attribute_value.value_type
+        vt = XSD_TYPE_CLASSES.get(vt_str, datatypes.String)
+        vt_python = convert_util.convert_xsdtype_to_primitive_type(vt)
+        min_val = attribute_value.min_ if attribute_value.min_ != "" else None
+        max_val = attribute_value.max_ if attribute_value.max_ != "" else None
+        # Cast string min/max to the Python type matching value_type
+        if min_val is not None and not isinstance(min_val, vt_python):
+            try:
+                min_val = vt_python(min_val)
+            except (ValueError, TypeError):
+                pass
+        if max_val is not None and not isinstance(max_val, vt_python):
+            try:
+                max_val = vt_python(max_val)
+            except (ValueError, TypeError):
+                pass
+        return model.Range(
+            id_short=attribute_name,
+            value_type=vt_python,
+            min=min_val,
+            max=max_val,
             semantic_id=sid or get_semantic_id(attribute_value),
             qualifier=q, supplemental_semantic_id=s, description=d)
 
@@ -271,6 +367,30 @@ def create_property(
     return property
 
 
+def _inline_dict_children(
+    attr_value: dict,
+    field_info=None,
+) -> list:
+    """Convert Dict[str, AnySubmodelElement] entries to named BaSyx children.
+
+    Each dict key becomes the id_short of the corresponding child element.
+    Works for any AAS element type: Property, Range, Operation,
+    SubmodelElementCollection, SubmodelElementList, MultiLanguageProperty, etc.
+
+    The dict key always wins as the authoritative id_short (overrides any
+    id_short already set on the model instance).
+    """
+    children = []
+    for key, val in attr_value.items():
+        if val is None:
+            continue
+        sme = create_submodel_element(key, val, field_info=field_info)
+        if sme is not None:
+            sme.id_short = key
+            children.append(sme)
+    return children
+
+
 def create_submodel_element_collection(
     model_sec: aas_model.SubmodelElementCollection,
 ) -> model.SubmodelElementCollection:
@@ -282,8 +402,18 @@ def create_submodel_element_collection(
         # Skip metadata fields (not actual submodel elements)
         if attribute_info.name in ("qualifiers", "supplemental_semantic_ids"):
             continue
+
+        attr_value = attribute_info.value
+
+        # Dict[str, SMC] → inline entries as direct children (key → id_short)
+        if isinstance(attr_value, dict):
+            value.extend(
+                _inline_dict_children(attr_value, field_info=attribute_info.field_info)
+            )
+            continue
+
         sme = create_submodel_element(
-            attribute_info.name, attribute_info.value,
+            attribute_info.name, attr_value,
             field_info=attribute_info.field_info,
         )
         attribute_data_specification = (
