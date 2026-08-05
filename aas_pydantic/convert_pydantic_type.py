@@ -22,6 +22,7 @@ from aas_pydantic.convert_util import (
     convert_primitive_type_to_xsdtype,
     get_attribute_field_infos,
     get_template_id,
+    patch_id_short_with_temp_attribute,
 )
 
 import basyx.aas.adapter.json.json_serialization
@@ -32,20 +33,22 @@ logger = logging.getLogger(__name__)
 
 def convert_model_to_aas_template(
     model_type: type[aas_model.AssetAdministrationShell],
-) -> model.DictObjectStore[model.Identifiable]:
+) -> model.DictIdentifiableStore[model.Identifiable]:
     """
-    Convert a model aas to an Basyx AssetAdministrationShell and return it as a DictObjectStore with all Submodels
+    Convert a model aas to an Basyx AssetAdministrationShell and return it as a DictIdentifiableStore with all Submodels
 
     Args:
         model_type (type[aas_model.AssetAdministrationShell]): Type of the model
 
     Returns:
-        model.DictObjectStore[model.Identifiable]: DictObjectStore with all Submodels
+        model.DictIdentifiableStore[model.Identifiable]: DictIdentifiableStore with all Submodels
     """
     aas_attribute_infos = get_attribute_field_infos(model_type)
     aas_submodels = {}
     aas_submodel_data_specifications = []
     for attribute_info in aas_attribute_infos:
+        if attribute_info.name in ("asset_type", "derived_from", "specific_asset_ids"):
+            continue
         if typing.get_origin(attribute_info.field_info.annotation) == Union:
             types_to_check = [
                 type_annotation
@@ -115,11 +118,22 @@ def convert_model_to_aas_template(
         )
         + aas_submodel_data_specifications,
     )
-    obj_store: model.DictObjectStore[model.Identifiable] = model.DictObjectStore()
+    obj_store: model.DictIdentifiableStore[model.Identifiable] = model.DictIdentifiableStore()
     obj_store.add(basyx_aas)
     for sm in aas_submodels.values():
         obj_store.add(sm)
     return obj_store
+
+
+def _is_container_field(annotation: Any) -> bool:
+    """True for values-model / ``Dict[str, X]`` container fields whose children
+    cannot be represented as named fields in a template."""
+    if typing.get_origin(annotation) == dict:
+        return True
+    ann = annotation
+    if typing.get_origin(ann) in (typing.Union,):
+        return False
+    return isinstance(ann, type) and issubclass(ann, aas_model.ContainerValue)
 
 
 def convert_model_instance_to_submodel_template(
@@ -138,6 +152,8 @@ def convert_model_to_submodel_template(
     submodel_element_data_specifications = []
 
     for attribute_info in submodel_attributes:
+        if _is_container_field(attribute_info.field_info.annotation):
+            continue
         if typing.get_origin(attribute_info.field_info.annotation) == Union:
             types_to_check = [
                 type_annotation
@@ -245,6 +261,15 @@ def create_submodel_element_template(
     """
     if not attribute_type:
         return
+    if typing.get_origin(attribute_type) == dict:
+        # Dict[str, X] container fields (e.g. the base ``value`` /
+        # ``submodel_element`` containers) hold heterogeneous children that a
+        # named-field template cannot represent as a single element — skip.
+        return
+    if isinstance(attribute_type, type) and issubclass(attribute_type, aas_model.ContainerValue):
+        # Values-model container fields (``value: MyValues``) hold the child
+        # elements — a named-field template cannot represent them either.
+        return
     if (
         typing.get_origin(attribute_type) == list
         or typing.get_origin(attribute_type) == tuple
@@ -272,6 +297,35 @@ def create_submodel_element_template(
     elif issubclass(attribute_type, aas_model.SubmodelElementCollection):
         smc = create_submodel_element_collection(attribute_type)
         return smc
+    elif issubclass(attribute_type, aas_model.SubmodelElementList):
+        return create_submodel_element_list_template(attribute_name, attribute_type)
+    elif issubclass(attribute_type, aas_model.Entity):
+        # Entities are represented as SMC templates in the basyx direction.
+        return create_submodel_element_collection(attribute_type)
+    elif issubclass(attribute_type, aas_model.Operation):
+        return model.Operation(id_short=attribute_name)
+    elif issubclass(attribute_type, aas_model.Capability):
+        return model.Capability(id_short=attribute_name)
+    elif issubclass(attribute_type, aas_model.Property):
+        return model.Property(id_short=attribute_name, value_type=model.datatypes.String)
+    elif issubclass(attribute_type, aas_model.MultiLanguageProperty):
+        return model.MultiLanguageProperty(id_short=attribute_name)
+    elif issubclass(attribute_type, aas_model.Range):
+        return model.Range(id_short=attribute_name, value_type=model.datatypes.String)
+    elif issubclass(attribute_type, aas_model.ReferenceElement):
+        return model.ReferenceElement(id_short=attribute_name)
+    elif issubclass(attribute_type, aas_model.RelationshipElement):
+        empty_ref = model.ExternalReference(
+            key=(
+                model.Key(
+                    type_=model.KeyTypes.GLOBAL_REFERENCE,
+                    value="https://example.com/reference",
+                ),
+            )
+        )
+        return model.RelationshipElement(
+            id_short=attribute_name, first=empty_ref, second=empty_ref
+        )
     elif issubclass(attribute_type, aas_model.File):
         return create_file(attribute_type)
     elif issubclass(attribute_type, aas_model.Blob):
@@ -280,6 +334,44 @@ def create_submodel_element_template(
         property = create_property(attribute_name, attribute_type)
 
         return property
+
+
+def create_submodel_element_list_template(
+    attribute_name: str,
+    sml_type: type[aas_model.SubmodelElementList],
+) -> model.SubmodelElementList:
+    """Create a basyx SubmodelElementList template from a SubmodelElementList subclass.
+
+    The item element type is inferred from the ``value`` field annotation.
+    """
+    ann = sml_type.model_fields["value"].annotation
+    args = typing.get_args(ann)
+    item_type = args[0] if args else None
+
+    submodel_elements = []
+    if (
+        item_type
+        and item_type is not NoneType
+        and item_type is not typing.Any
+        and item_type is not aas_model.SubmodelElement
+    ):
+        el = create_submodel_element_template(attribute_name, item_type)
+        if el is not None:
+            submodel_elements.append(el)
+
+    return model.SubmodelElementList(
+        id_short=attribute_name,
+        type_value_list_element=(
+            type(submodel_elements[0]) if submodel_elements else None
+        ),
+        value_type_list_element=(
+            submodel_elements[0].value_type
+            if submodel_elements and isinstance(submodel_elements[0], model.Property)
+            else None
+        ),
+        value=submodel_elements,
+        order_relevant=True,
+    )
 
 
 def create_property(
@@ -305,6 +397,8 @@ def create_submodel_element_collection(
     submodel_element_data_specifications = []
 
     for attribute_info in smc_attributes:
+        if _is_container_field(attribute_info.field_info.annotation):
+            continue
         if typing.get_origin(attribute_info.field_info.annotation) == Union:
             types_to_check = [
                 type_annotation
@@ -386,23 +480,6 @@ def create_submodel_element_collection(
         semantic_id="",
     )
     return smc
-
-
-def patch_id_short_with_temp_attribute(
-    submodel_element_collection: model.SubmodelElementCollection,
-) -> None:
-    """
-    Patch the id_short of a SubmodelElementCollection as an attribute in the value of the SubmodelElementCollection, to make it accesible after retrieving from the value list.
-
-    Args:
-        submodel_element_collection (model.SubmodelElementCollection): SubmodelElementCollection to patch
-    """
-    temp_id_short_property = model.Property(
-        id_short="temp_id_short_attribute_" + uuid.uuid4().hex,
-        value_type=convert_primitive_type_to_xsdtype(str),
-        value=submodel_element_collection.id_short,
-    )
-    submodel_element_collection.value.add(temp_id_short_property)
 
 
 def create_submodel_element_list(

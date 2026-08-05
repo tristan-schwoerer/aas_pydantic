@@ -1,5 +1,7 @@
+import copy
 import datetime
 import json
+import re
 from types import NoneType
 from typing import Any, Dict, List, Union
 import uuid
@@ -39,6 +41,22 @@ class AttributeInfo(AttributeFieldInfo):
     value: Any
 
 
+# ── Model fields that carry AAS metadata, never submodel elements ─────────
+# These come from Identifiable/Referable/HasSemantics and must be excluded
+# whenever a model is walked to build/convert submodel elements.
+META_FIELDS = frozenset(
+    {
+        "id",
+        "id_short",
+        "description",
+        "display_name",
+        "semantic_id",
+        "supplemental_semantic_ids",
+        "qualifiers",
+    }
+)
+
+
 def get_attribute_field_infos(
     obj: Union[
         type[aas_model.AAS],
@@ -56,7 +74,7 @@ def get_attribute_field_infos(
     """
     attribute_infos = []
     for attribute_name, field_info in obj.model_fields.items():
-        if attribute_name in ["id", "description", "id_short", "semantic_id"]:
+        if attribute_name in META_FIELDS:
             continue
         if attribute_name.startswith("_"):
             continue
@@ -80,7 +98,7 @@ def get_attribute_infos(
     """
     attribute_infos = []
     for attribute_name, field_info in obj.model_fields.items():
-        if attribute_name in ["id", "description", "id_short", "semantic_id"]:
+        if attribute_name in META_FIELDS:
             continue
         if attribute_name.startswith("_"):
             continue
@@ -135,7 +153,31 @@ def get_basyx_description_from_model(
             raise ValueError
     except ValueError:
         dict_description = {"en": model_object.description}
-    return model.LangStringSet(dict_description)
+    return model.MultiLanguageTextType(dict_description)
+
+
+def get_basyx_display_name_from_model(
+    model_object: typing.Any,
+) -> typing.Optional[model.MultiLanguageNameType]:
+    """
+    Create a basyx MultiLanguageNameType from a model's ``display_name``
+    (a lang→text map, mirroring basyx ``Referable.display_name``).
+    """
+    display_name = getattr(model_object, "display_name", None)
+    if not display_name:
+        return None
+    return model.MultiLanguageNameType(dict(display_name))
+
+
+def get_str_display_name(
+    display_name: typing.Union[model.MultiLanguageNameType, dict, None],
+) -> typing.Optional[typing.Dict[str, str]]:
+    """
+    Convert a basyx display_name (lang→text) to a plain dict, or None when empty.
+    """
+    if not display_name:
+        return None
+    return {str(k): str(v) for k, v in dict(display_name).items()}
 
 
 def get_class_name_from_basyx_model(
@@ -653,6 +695,36 @@ def get_semantic_id_value_of_model(
     return basyx_model.semantic_id.key[0].value
 
 
+def convert_basyx_value_type_to_xsd(value_type: Any) -> str:
+    """Map a basyx datatype class back to its xs:type string (e.g. datatypes.String -> 'xs:string')."""
+    for name, cls in datatypes.XSD_TYPE_CLASSES.items():
+        if value_type is cls:
+            return name
+    return "xs:string"
+
+
+def key_type_to_basyx_name(type_str: str) -> str:
+    """Convert an AAS KeyType string (PascalCase, as in AAS JSON / kg-bridge)
+    to the basyx KeyTypes enum member name (SCREAMING_SNAKE_CASE).
+
+    e.g. 'AssetAdministrationShell' -> 'ASSET_ADMINISTRATION_SHELL'
+    """
+    if not type_str:
+        return type_str
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type_str).upper()
+
+
+def key_type_from_basyx_name(name: str) -> str:
+    """Convert a basyx KeyTypes enum member name to the AAS KeyType string
+    (PascalCase, as in AAS JSON / kg-bridge).
+
+    e.g. 'ASSET_ADMINISTRATION_SHELL' -> 'AssetAdministrationShell'
+    """
+    if not name:
+        return name
+    return "".join(p.capitalize() for p in name.split("_") if p)
+
+
 def convert_xsdtype_to_primitive_type(
     xsd_data_type: model.DataTypeDefXsd,
 ) -> aas_model.PrimitiveSubmodelElement:
@@ -732,6 +804,24 @@ def convert_primitive_type_to_xsdtype(
         raise NotImplementedError("Type not implemented:", primitive_type)
 
 
+def patch_id_short_with_temp_attribute(
+    submodel_element_collection: model.SubmodelElementCollection,
+) -> None:
+    """AASd-120 patch: store an SMC item's id_short as a temporary Property
+    inside its own ``value``.
+
+    ``SubmodelElementList`` items must not carry an id_short in basyx
+    (AASd-120), so the id_short is parked in a synthetic ``temp_id_short_…``
+    Property that ``unpatch_id_short_from_temp_attribute`` / 
+    ``unpatched_id_short_smc_copy`` restore on the way back."""
+    temp_id_short_property = model.Property(
+        id_short="temp_id_short_attribute_" + uuid.uuid4().hex,
+        value_type=convert_primitive_type_to_xsdtype(str),
+        value=submodel_element_collection.id_short,
+    )
+    submodel_element_collection.value.add(temp_id_short_property)
+
+
 def unpatch_id_short_from_temp_attribute(smec: model.SubmodelElementCollection):
     """
     Unpatches the id_short attribute of a SubmodelElementCollection from the temporary attribute.
@@ -766,6 +856,20 @@ def unpatch_id_short_from_temp_attribute(smec: model.SubmodelElementCollection):
         embedded_data_specifications=smec.embedded_data_specifications,
     )
     return new_smec
+
+
+def unpatched_id_short_smc_copy(smec: model.SubmodelElementCollection):
+    """Return a copy of *smec* with the real id_short restored from the temp
+    attribute, WITHOUT mutating the original (AASd-120 list items).
+
+    The container-style back-conversion uses this so the source basyx store
+    is left intact — the mutating variant above is only safe in the
+    named-field path, which repatches the original afterward.
+    """
+    if not smec.id_short.startswith("generated_submodel_list_hack_"):
+        return smec
+    work = copy.deepcopy(smec)
+    return unpatch_id_short_from_temp_attribute(work)
 
 
 def repatch_id_short_to_temp_attribute(

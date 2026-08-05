@@ -18,13 +18,13 @@ from aas_pydantic.convert_util import (
     unpatch_id_short_from_temp_attribute,
 )
 def convert_object_store_to_pydantic_types(
-    obj_store: model.DictObjectStore,
+    obj_store: model.DictIdentifiableStore,
 ) -> typing.List[type[aas_model.AssetAdministrationShell]]:
     """
     Converts an object store with AAS and submodels to pydantic models, representing the original data structure.
 
     Args:
-        obj_store (model.DictObjectStore): Object store with AAS and submodels
+        obj_store (model.DictIdentifiableStore): Object store with AAS and submodels
 
     Returns:
         typing.List[aas_model.AssetAdministrationShell]: List of pydantic models
@@ -97,7 +97,7 @@ def convert_aas_to_pydantic_type(
                 {attribute_name: typing.Annotated[attribute_type, Field(examples=[])]}
             )
     model_type = create_model(
-        aas_class_name, **dict_dynamic_model_creation, __base__=aas_model.AssetAdministrationShell
+        aas_class_name, **dict_dynamic_model_creation, __base__=aas_model.AAS
     )
     return model_type
 
@@ -126,6 +126,14 @@ def get_submodel_element_type(
         return convert_property_to_pydantic_model(sm_element)
     elif isinstance(sm_element, model.MultiLanguageProperty):
         return convert_multi_language_property_to_pydantic_model(sm_element)
+    elif isinstance(sm_element, model.Range):
+        return aas_model.Range
+    elif isinstance(sm_element, model.Capability):
+        return aas_model.Capability
+    elif isinstance(sm_element, model.Operation):
+        return aas_model.Operation
+    elif isinstance(sm_element, model.Entity):
+        return aas_model.Entity
     elif isinstance(sm_element, model.File):
         return convert_file_to_pydantic_model(sm_element)
     elif isinstance(sm_element, model.Blob):
@@ -327,76 +335,35 @@ def convert_submodel_collection_to_pydantic_model(
 
 def convert_submodel_list_to_pydantic_model(
     sm_element: model.SubmodelElementList, immutable: bool = False
-) -> type[
-    typing.Union[
-        typing.List[aas_model.SubmodelElement], typing.Set[aas_model.SubmodelElement]
-    ]
-]:
+) -> type:
     """
-    Converts a SubmodelElementList to a Pydantic model.
+    Converts a SubmodelElementList to a Pydantic model type.
 
-    Args:
-        sm_element (model.SubmodelElementList): SubmodelElementList to convert.
-
-    Returns:
-        typing.List[aas_model.SubmodelElement]: List of Pydantic models of the submodel elements.
+    Rich-only: SubmodelElementList fields are typed as the SubmodelElementList
+    base class.  The instance converters populate its typed ``value`` items.
     """
-    if sm_element.value_type_list_element is not None:
-        value_type = convert_xsdtype_to_primitive_type(
-            sm_element.value_type_list_element
-        )
-    else:
-        sm_element_value = sm_element.value[0]
-        if isinstance(sm_element_value, model.SubmodelElementCollection):
-            new_sm_element_value = unpatch_id_short_from_temp_attribute(
-                sm_element_value
-            )
-            value_type = convert_submodel_collection_to_pydantic_model(
-                new_sm_element_value
-            )
-            repatch_id_short_to_temp_attribute(sm_element_value, new_sm_element_value)
-
-        elif isinstance(sm_element_value, model.SubmodelElementList):
-            value_type = convert_submodel_list_to_pydantic_model(sm_element_value)
-        elif isinstance(sm_element_value, model.ReferenceElement):
-            value_type = convert_reference_element_to_pydantic_model(sm_element_value)
-        elif isinstance(sm_element_value, model.RelationshipElement):
-            value_type = convert_relationship_element_to_pydantic_model(
-                sm_element_value
-            )
-        elif isinstance(sm_element_value, model.Property):
-            value_type = convert_property_to_pydantic_model(sm_element_value)
-        else:
-            raise NotImplementedError("Type not implemented:", type(sm_element_value))
-    if immutable:
-        return typing.Tuple[value_type, ...]
-    if not sm_element.order_relevant:
-        return typing.Set[value_type]
-    return typing.List[value_type]
+    return aas_model.SubmodelElementList
 
 
 def convert_reference_element_to_pydantic_model(
     sm_element: model.ReferenceElement,
-) -> type[aas_model.Reference]:
+) -> type[aas_model.ReferenceElement]:
     """
-    Converts a ReferenceElement to a Pydantic model.
-
-    Args:
-        sm_element (model.ReferenceElement): ReferenceElement to convert.
+    Converts a ReferenceElement to a Pydantic model type.
 
     Returns:
-        str: Value of the ReferenceElement.
+        type[aas_model.ReferenceElement]: Pydantic type of the ReferenceElement.
     """
-    return aas_model.Reference
+    return aas_model.ReferenceElement
 
 
 def convert_relationship_element_to_pydantic_model(
     sm_element: model.RelationshipElement,
-) -> type[typing.Tuple[aas_model.Reference, aas_model.Reference]]:
+) -> type[aas_model.RelationshipElement]:
     """
-    Converts a RelationshipElement to a Pydantic model.
+    Converts a RelationshipElement to a Pydantic model type.
     """
-    return typing.Tuple[aas_model.Reference, aas_model.Reference]
+    return aas_model.RelationshipElement
 
 
 def convert_property_to_pydantic_model(
@@ -409,14 +376,14 @@ def convert_property_to_pydantic_model(
         sm_element (model.Property): Property to convert.
 
     Returns:
-        aas_model.PrimitiveSubmodelElement: Value of the Property.
+        type[aas_model.Property]: Pydantic type of the Property.
     """
-    return convert_xsdtype_to_primitive_type(sm_element.value_type)
+    return aas_model.Property
 
 
 def convert_multi_language_property_to_pydantic_model(
     sm_element: model.MultiLanguageProperty,
-) -> aas_model.PrimitiveSubmodelElement:
+) -> type[aas_model.MultiLanguageProperty]:
     """
     Converts a MultiLanguageProperty to a Pydantic model.
 
@@ -424,9 +391,9 @@ def convert_multi_language_property_to_pydantic_model(
         sm_element (model.MultiLanguageProperty): MultiLanguageProperty to convert.
 
     Returns:
-        aas_model.PrimitiveSubmodelElement: Value of the MultiLanguageProperty.
+        type[aas_model.MultiLanguageProperty]: Pydantic type of the MultiLanguageProperty.
     """
-    return str
+    return aas_model.MultiLanguageProperty
 
 
 def convert_file_to_pydantic_model(sm_element: model.File) -> type[aas_model.File]:
