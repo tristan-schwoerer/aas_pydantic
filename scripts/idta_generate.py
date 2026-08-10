@@ -147,22 +147,12 @@ def extract_cardinality(el: dict) -> str:
     """Cardinality qualifier value (e.g. ``ZeroToMany``, ``ZeroToOne``, ``One``)
     — how many instances of this element a container may hold.
 
-    Templates encode it under three different qualifier ``type`` spellings:
-    ``SMT/Cardinality``, ``Cardinality`` (AID, ConceptQualifier) and
-    ``SMT/SMT/Cardinality`` (CCT) — all end in ``Cardinality``.  Values also
-    carry typos in the wild (``ZerotoMany``, ``ZerotToOne``, ``ZeroToOne ``),
-    so the value is normalized before returning."""
+    Templates encode it under the standard qualifier ``type``
+    ``SMT/Cardinality``."""
     for q in (el.get("qualifiers") or []):
-        if "Cardinality" in q.get("type", ""):
-            return normalize_cardinality(q.get("value", ""))
+        if q.get("type") == "SMT/Cardinality":
+            return (q.get("value") or "").strip()
     return ""
-
-
-def normalize_cardinality(value: str) -> str:
-    """Normalize template cardinality values (strip whitespace + common typos)."""
-    v = (value or "").strip()
-    # templates contain typos: 'ZerotoMany', 'ZerotToOne', 'ZeroToOne '
-    return v.replace("Zeroto", "ZeroTo").replace("Zerot", "ZeroT")
 
 
 # Cardinalities that allow more than one instance of an element → the

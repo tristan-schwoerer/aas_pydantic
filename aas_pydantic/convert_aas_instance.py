@@ -327,7 +327,7 @@ def _multi_fields_by_sid(values_cls):
     result = {}
     for fname, ann in hints.items():
         args = typing.get_args(ann)
-        if len(args) == 2 and args[0] is str:
+        if len(args) == 2 and args[0] in (str, int):
             inner = args[1]
             if isinstance(inner, type) and issubclass(inner, aas_model.SubmodelElement):
                 sid = _element_cls_sid(inner)
@@ -347,6 +347,27 @@ def _multi_element_cls(values_cls, field: str):
     except Exception:
         pass
     return None
+
+
+def _multi_key_type(values_cls, field: str):
+    """Key type (int/str) of a ``Dict[K, E]`` multi field, else ``str``."""
+    try:
+        hints = typing.get_type_hints(values_cls, include_extras=True)
+    except Exception:
+        return str
+    args = typing.get_args(hints.get(field))
+    return args[0] if len(args) == 2 and args[0] in (str, int) else str
+
+
+def _dict_id_short_to_key(id_short, key_type):
+    """Inverse of ``_dict_key_to_id_short``: ``param_01`` → 1 for
+    int-keyed fields; strings pass through."""
+    if key_type is int:
+        try:
+            return int(str(id_short).removeprefix("param_"))
+        except ValueError:
+            return id_short
+    return id_short
 
 
 def _container_children_data(basyx_children, values_cls):
@@ -393,7 +414,8 @@ def _container_children_data(basyx_children, values_cls):
         if field is not None:
             elem_cls = _multi_element_cls(values_cls, field)
             converted = _container_element_to_pydantic(c, expected_cls=elem_cls)
-            out.setdefault(field, {})[c.id_short] = converted
+            key = _dict_id_short_to_key(c.id_short, _multi_key_type(values_cls, field))
+            out.setdefault(field, {})[key] = converted
         else:
             out[c.id_short] = _container_element_to_pydantic(c)
     return out

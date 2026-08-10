@@ -434,6 +434,16 @@ def _dict_item_type(ann):
     return None
 
 
+def _dict_key_to_id_short(key):
+    """AAS id_short must be a non-empty string starting with a letter
+    (AASd-002).  ``int`` dict keys (``Dict[int, X]``) are mapped to a
+    zero-padded ``param_<n>`` id_short so they survive conversion; string
+    keys pass through unchanged."""
+    if isinstance(key, int):
+        return f"param_{key:02d}"
+    return key
+
+
 def _inline_dict_children(
     attr_value,
     field_info=None,
@@ -497,9 +507,10 @@ def _inline_dict_children(
     for key, val in items:
         if val is None:
             continue
-        sme = create_submodel_element(key, val, field_info=field_info)
+        id_short = _dict_key_to_id_short(key)
+        sme = create_submodel_element(id_short, val, field_info=field_info)
         if sme is not None:
-            sme.id_short = key
+            sme.id_short = id_short
             children.append(sme)
     return children
 
