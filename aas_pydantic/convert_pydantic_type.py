@@ -126,14 +126,11 @@ def convert_model_to_aas_template(
 
 
 def _is_container_field(annotation: Any) -> bool:
-    """True for values-model / ``Dict[str, X]`` container fields whose children
-    cannot be represented as named fields in a template."""
+    """True for ``Dict[str, X]`` container fields whose children cannot be
+    represented as named fields in a template."""
     if typing.get_origin(annotation) == dict:
         return True
-    ann = annotation
-    if typing.get_origin(ann) in (typing.Union,):
-        return False
-    return isinstance(ann, type) and issubclass(ann, aas_model.ContainerValue)
+    return False
 
 
 def convert_model_instance_to_submodel_template(
@@ -265,10 +262,6 @@ def create_submodel_element_template(
         # Dict[str, X] container fields (e.g. the base ``value`` /
         # ``submodel_element`` containers) hold heterogeneous children that a
         # named-field template cannot represent as a single element — skip.
-        return
-    if isinstance(attribute_type, type) and issubclass(attribute_type, aas_model.ContainerValue):
-        # Values-model container fields (``value: MyValues``) hold the child
-        # elements — a named-field template cannot represent them either.
         return
     if (
         typing.get_origin(attribute_type) == list

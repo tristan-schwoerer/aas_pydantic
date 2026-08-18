@@ -73,6 +73,8 @@ def get_attribute_field_infos(
         List[AttributeFieldInfo]: List of attributes of the object
     """
     attribute_infos = []
+    # ``obj`` is a CLASS here (type[...]) — class attribute access, not the
+    # deprecated instance access.
     for attribute_name, field_info in obj.model_fields.items():
         if attribute_name in META_FIELDS:
             continue
@@ -97,7 +99,7 @@ def get_attribute_infos(
         List[AttributeInfo]: List of attributes of the object
     """
     attribute_infos = []
-    for attribute_name, field_info in obj.model_fields.items():
+    for attribute_name, field_info in type(obj).model_fields.items():
         if attribute_name in META_FIELDS:
             continue
         if attribute_name.startswith("_"):
@@ -888,3 +890,45 @@ def repatch_id_short_to_temp_attribute(
     for sm_element in values_to_repatch:
         smec.value.add(sm_element)
     return smec
+
+
+def strip_temp_id_short_attributes(store) -> None:
+    """Remove the AASd-120 ``temp_id_short_attribute_*`` patch Properties from
+    every SubmodelElementCollection in *store* (mutates in place).
+
+    The temp attribute is only a round-trip vehicle for restoring an SML
+    item's id_short on the way back; it must never appear in a serialized or
+    published AAS.  Call before ``object_store_to_json`` / AASX export, e.g.::
+
+        strip_temp_id_short_attributes(obj_store)
+        json_str = json_serialization.object_store_to_json(obj_store)
+
+    Only SMC items of a SubmodelElementList ever receive the patch, so walking
+    Submodel / SMC / SML containers is sufficient (Entity/Operation children
+    never get one).
+    """
+    def _strip_element(el) -> None:
+        if isinstance(el, model.Submodel):
+            for child in el.submodel_element:
+                _strip_element(child)
+        elif isinstance(el, model.SubmodelElementCollection):
+            if el.value:
+                for child in list(el.value):
+                    if (
+                        isinstance(child, model.Property)
+                        and child.id_short
+                        and child.id_short.startswith("temp_id_short_attribute_")
+                    ):
+                        el.value.remove(child)
+                    else:
+                        _strip_element(child)
+        elif isinstance(el, model.SubmodelElementList):
+            for child in el.value:
+                _strip_element(child)
+
+    for obj in store:
+        if isinstance(obj, model.AssetAdministrationShell):
+            for sm in obj.submodel:
+                _strip_element(sm)
+        elif isinstance(obj, model.Submodel):
+            _strip_element(obj)

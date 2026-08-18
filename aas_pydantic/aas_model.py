@@ -10,7 +10,7 @@ import typing
 from basyx.aas.model import (
     AssetAdministrationShell,
     DictIdentifiableStore,
-    Submodel,
+    Submodel
 )
 from pydantic import (
     AfterValidator,
@@ -18,6 +18,7 @@ from pydantic import (
     Field,
     ValidationError,
     field_serializer,
+    model_serializer,
     model_validator,
 )
 
@@ -122,7 +123,7 @@ class AAS(Identifiable):
     @model_validator(mode="after")
     def check_submodels(self) -> Any:
         _meta = {"id", "id_short", "description", "display_name", "asset_type", "derived_from", "specific_asset_ids"}
-        for field_name, field_info in self.model_fields.items():
+        for field_name, field_info in type(self).model_fields.items():
             if field_name in _meta:
                 continue
             elif (
@@ -183,11 +184,25 @@ def _stamp_container_id_shorts(model: Any) -> None:
     The dict key is the single source of truth for a child's id_short, so
     source never repeats ``id_short=<key>`` on the instances.  This stamps
     each child's id_short from its key on every constructed model
-    (defaults included).  Children are copied, never mutated."""
-    for container_key in ("value", "submodel_element", "statements"):
-        container = getattr(model, container_key, None)
+    (defaults included).  Children are copied, never mutated.
+
+    Named-field style: dynamic maps are ``Dict[str, X]`` fields anywhere on a
+    container (``Variables.variable``, ``MqttActions.property_name``,
+    ``Endpoints.endpoint``, …)."""
+    try:
+        hints = typing.get_type_hints(type(model), include_extras=True)
+    except Exception:
+        hints = {k: v.annotation for k, v in type(model).model_fields.items()}
+    for fname, ann in hints.items():
+        if fname in ("id_short", "description", "display_name", "semantic_id",
+                     "qualifiers", "supplemental_semantic_ids", "category"):
+            continue
+        container = getattr(model, fname, None)
         if not isinstance(container, dict):
             continue
+        if typing.get_origin(ann) is not dict:
+            # e.g. a plain dict value (not a model field) — still stamp it.
+            pass
         for k, v in list(container.items()):
             if isinstance(v, SubmodelElement) and v.id_short != k:
                 container[k] = v.model_copy(update={"id_short": k})
@@ -219,37 +234,10 @@ def _dump_container(container: Any, concept_sid: str = "") -> Any:
     """Serialize a container losslessly — each child is dumped with its own
     concrete model and tagged with ``modelType`` (its class name).
 
-    Handles values models (``ContainerValue``: each field is a child),
-    ``Dict[str, SubmodelElement]`` containers, and lists (SML/Operation).
+    Handles ``Dict[str, SubmodelElement]`` containers and lists (SML/Operation).
     pydantic's ``Dict[str, SubmodelElement]`` serializer uses the abstract
     ``SubmodelElement`` schema and drops subclass fields, hence the explicit
     per-child dump here."""
-    if isinstance(container, BaseModel):
-        # values model — field name → tagged child (nested Dict/List fields,
-        # e.g. multi-cardinality ``Dict[str, X]`` children, recurse losslessly)
-        out = {}
-        for f in container.model_fields:
-            v = getattr(container, f)
-            if isinstance(v, BaseModel):
-                out[f] = _tag_dump(v)
-            elif isinstance(v, dict):
-                # Dict-map child: stamp the field's concept semanticId on any
-                # entry lacking one (e.g. a bare ``Property`` in ``Dict[str,
-                # Mode]``) so back-conversion can regroup it by sid.
-                out[f] = _dump_container(v, concept_sid=_field_concept_sid(container, f))
-            elif isinstance(v, (list, tuple)):
-                out[f] = _dump_container(v)
-            else:
-                out[f] = v
-        extra = getattr(container, "__pydantic_extra__", None) or {}
-        for k, v in extra.items():
-            if isinstance(v, BaseModel):
-                out[k] = _tag_dump(v)
-            elif isinstance(v, (dict, list, tuple)):
-                out[k] = _dump_container(v)
-            else:
-                out[k] = v
-        return out
     if isinstance(container, dict):
         return {
             k: _tag_dump(v, concept_sid) if isinstance(v, BaseModel) else v
@@ -300,75 +288,44 @@ def _tag_dump(model: BaseModel, concept_sid: str = "") -> dict:
     return d
 
 
-class ContainerValue(BaseModel):
-    """Base for per-container values models: every field is a child
-    SubmodelElement, and the FIELD NAME IS the child's id_short (stamped on
-    validation).  This is what makes inheritance clean — subclass the values
-    class to add/override children instead of merging string-keyed dicts.
+def _serialize_element_containers(model: BaseModel, handler) -> Any:
+    """Lossless ``model_dump`` for named-field containers.
 
-    Raw dicts (config / AAS JSON / pydantic dumps) are coerced to concrete
-    element types by ``coerce_submodel_element`` (registry-driven), with the
-    field's declared type enforced for typed fields.
-
-    The base is open (``extra="allow"``) so generic/dynamic containers can
-    hold arbitrary children; typed values classes may set
-    ``model_config = {"extra": "forbid"}`` to catch typos.
+    pydantic's default serializer uses the *declared* schema for the values of
+    ``Dict[str, E]`` / ``List[E]`` fields, so subclass instances inside them
+    (e.g. ``Position`` in ``Dict[str, ParameterItem]``) lose their extra
+    fields (x/y/yaw).  Re-dump every element-container field from the live
+    model via ``_dump_container`` (concrete per-child dump + ``modelType``
+    tag), so a dump child's concrete subclass survives a round-trip through
+    ``model_dump()``.
     """
-    model_config = {"extra": "allow"}
-
-    @model_validator(mode="before")
-    @classmethod
-    def coerce_values(cls, data):
-        if isinstance(data, BaseModel):
-            return data
-        if not isinstance(data, dict):
-            return data
-        out = {}
-        for k, v in data.items():
-            field = cls.model_fields.get(k)
-            target = _resolve_annotation(field.annotation) if field else None
-            if isinstance(v, dict) and "modelType" in v:
-                # dump child carries its own type discriminator — the registry
-                # resolves the concrete class (e.g. ExtendedSkills overriding a
-                # generated Skills field); never force the declared type.
-                target = None
-            origin = typing.get_origin(target)
-            if origin is dict and isinstance(v, dict):
-                # nested Dict[str, X] container field (e.g. Term.terms) —
-                # coerce each child, targeted at X.
-                args = typing.get_args(target)
-                item_tp = args[1] if len(args) == 2 else None
-                out[k] = {
-                    ik: coerce_submodel_element(iv, id_short=ik, target_type=item_tp)
-                    for ik, iv in v.items()
-                }
-            elif origin in (list, tuple, set) and isinstance(v, (list, tuple, set, dict)):
-                args = typing.get_args(target)
-                item_tp = args[0] if args else None
-                # back-conversion may pass a name-keyed dict for a list field
-                # (flattened in basyx) — use its values as the list items.
-                seq = v.values() if isinstance(v, dict) else v
-                out[k] = [
-                    coerce_submodel_element(iv, target_type=item_tp) for iv in seq
-                ]
-            else:
-                out[k] = coerce_submodel_element(v, id_short=k, target_type=target)
-        return out
-
-    @model_validator(mode="after")
-    def check_value_elements(self) -> Any:
-        names = list(self.model_fields)
-        names += list((getattr(self, "__pydantic_extra__", None) or {}).keys())
-        for field_name in names:
-            el = getattr(self, field_name, None)
-            if el is None:
-                continue
-            assert is_valid_submodel_element(el), \
-                f"Field {field_name} is not a valid SubmodelElement"
-            if isinstance(el, SubmodelElement) and el.id_short != field_name:
-                # field name == id_short (single canonical name per element)
-                setattr(self, field_name, el.model_copy(update={"id_short": field_name}))
-        return self
+    data = handler(model)
+    if not isinstance(data, dict):
+        return data
+    # NOTE: the SML ``value`` and Operation ``input_variable``/... fields have
+    # their own per-field serializers; this generic pass additionally covers
+    # every named ``Dict[str, E]`` / ``List[E]`` element-container field.
+    for fname in type(model).model_fields:
+        if fname in _ELEMENT_META_KEYS or fname in (
+            "type_value_list_element", "value_type_list_element",
+            "semantic_id_list_element", "order_relevant",
+        ):
+            continue
+        ann = _field_annotation(type(model), fname)
+        origin = typing.get_origin(ann)
+        if origin is dict:
+            args = typing.get_args(ann)
+            if len(args) == 2 and args[0] is str:
+                inner = _resolve_annotation(args[1])
+                if isinstance(inner, type) and issubclass(inner, SubmodelElement):
+                    data[fname] = _dump_container(getattr(model, fname))
+        elif origin in (list, tuple, set):
+            args = typing.get_args(ann)
+            if args:
+                inner = _resolve_annotation(args[0])
+                if isinstance(inner, type) and issubclass(inner, SubmodelElement):
+                    data[fname] = _dump_container(getattr(model, fname))
+    return data
 
 
 class SubmodelElement(HasSemantics, Referable):
@@ -378,6 +335,10 @@ class SubmodelElement(HasSemantics, Referable):
     optional semantic_id / qualifiers (from HasSemantics).  Concrete
     types — Property, Range, SMC, SML, Entity, etc. — inherit from here.
     """
+
+    @model_serializer(mode="wrap")
+    def _ser_element_containers(self, handler):
+        return _serialize_element_containers(self, handler)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -400,26 +361,15 @@ class SubmodelElement(HasSemantics, Referable):
 
 
 class SubmodelElementCollection(SubmodelElement):
-    """An SMC holding named child elements in ``value``.
+    """An SMC holding named child elements.
 
-    Mirrors basyx ``SubmodelElementCollection.value`` (a NamespaceSet keyed by
-    id_short) and the IDTA JSON ``value`` container.  Subclasses specialise the
-    value as a values model::
-
-        class MySMCValues(ContainerValue):
-            x: Property = Property(...)
-
-        class MySMC(SubmodelElementCollection):
-            value: MySMCValues = MySMCValues()
-
-    Dynamic name-keyed maps may instead keep ``value: Dict[str, X]``.
+    Mirrors basyx ``SubmodelElementCollection``.  Named-field style:
+    subclasses hold their children as DIRECT named element fields (field
+    name == id_short) and/or ``Dict[str, X]`` dynamic maps.  The base itself
+    is metadata-only — a bare SMC is an empty container, so every container
+    with children is a subclass that declares them.
     """
-    value: ContainerValue = ContainerValue()
     id_short: AasIdString = "SubmodelElementCollection"
-
-    @field_serializer("value")
-    def _ser_value_lossless(self, v, _info):
-        return _dump_container(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -429,17 +379,19 @@ class SubmodelElementCollection(SubmodelElement):
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         _stamp_container_id_shorts(self)
-        for field_name in self.model_fields:
+        for field_name in type(self).model_fields:
             if field_name in ["id_short", "description", "display_name",
                               "semantic_id", "qualifiers",
                               "supplemental_semantic_ids"]:
                 continue
-            if field_name == "value":
-                assert isinstance(getattr(self, field_name), (ContainerValue, dict)), \
-                    f"Field {field_name} must be a ContainerValue or Dict"
-                continue
-            assert is_valid_submodel_element(getattr(self, field_name)), \
+            el = getattr(self, field_name)
+            assert is_valid_submodel_element(el), \
                 f"Field {field_name} is not a valid SubmodelElement"
+            # field name == id_short (single canonical name per element) —
+            # a named-field child built from a config dict without an explicit
+            # id_short would otherwise keep the class default.
+            if isinstance(el, SubmodelElement) and el.id_short != field_name:
+                setattr(self, field_name, el.model_copy(update={"id_short": field_name}))
         return self
 
 
@@ -470,7 +422,7 @@ class SubmodelElementList(SubmodelElement):
 
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
-        for field_name in self.model_fields:
+        for field_name in type(self).model_fields:
             if field_name in ["id_short", "description", "display_name",
                               "semantic_id", "qualifiers",
                               "supplemental_semantic_ids",
@@ -489,17 +441,14 @@ class Entity(SubmodelElement):
 
     Mirrors basyx ``Entity``: an ``entity_type`` (SelfManagedEntity or
     CoManagedEntity), an optional ``global_asset_id`` (required for
-    self-managed entities per AASd-014), and child elements in the
-    ``statements`` container (a values model, like SMC ``value``).
+    self-managed entities per AASd-014), and child elements as DIRECT named
+    fields (named-field style) and/or ``Dict[str, X]`` dynamic maps.  The
+    base itself is metadata-only — a bare Entity is an empty container, so
+    every Entity with children is a subclass that declares them.
     """
     entity_type: str = "CoManagedEntity"
     id_short: AasIdString = "Entity"
     global_asset_id: str = ""
-    statements: ContainerValue = ContainerValue()
-
-    @field_serializer("statements")
-    def _ser_statements_lossless(self, v, _info):
-        return _dump_container(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -509,18 +458,18 @@ class Entity(SubmodelElement):
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         _stamp_container_id_shorts(self)
-        for field_name in self.model_fields:
+        for field_name in type(self).model_fields:
             if field_name in ["id_short", "description", "display_name",
                               "semantic_id", "qualifiers",
                               "supplemental_semantic_ids", "entity_type",
                               "global_asset_id"]:
                 continue
-            if field_name == "statements":
-                assert isinstance(getattr(self, field_name), (ContainerValue, dict)), \
-                    f"Field {field_name} must be a ContainerValue or Dict"
-                continue
-            assert is_valid_submodel_element(getattr(self, field_name)), \
+            el = getattr(self, field_name)
+            assert is_valid_submodel_element(el), \
                 f"Field {field_name} is not a valid SubmodelElement"
+            # field name == id_short (single canonical name per element).
+            if isinstance(el, SubmodelElement) and el.id_short != field_name:
+                setattr(self, field_name, el.model_copy(update={"id_short": field_name}))
         return self
 
 
@@ -554,10 +503,13 @@ class MultiLanguageProperty(SubmodelElement):
 
 
 class Range(SubmodelElement):
-    """A Range element matching basyx (``min``/``max``)."""
+    """A Range element matching basyx (``min``/``max``).
+
+    ``min``/``max`` are Optional — basyx allows open-ended ranges (a bound
+    may be unset, e.g. a JSON Schema with only ``minimum``)."""
     id_short: AasIdString = "Range"
-    min: str | int | float = ""
-    max: str | int | float = ""
+    min: Optional[str | int | float] = None
+    max: Optional[str | int | float] = None
     value_type: str = "xs:string"
 
 
@@ -581,7 +533,35 @@ class Key(BaseModel):
     """A key of a Reference, referencing an element in its name space."""
     model_config = {"extra": "forbid"}
 
-    type_: str = ""
+    # The AAS KeyType strings basyx accepts (PascalCase, as in AAS JSON and
+    # kg-bridge).  ``""`` means "unset" — the converter falls back to
+    # ASSET_ADMINISTRATION_SHELL.  basyx's internal ``_``-prefixed members and
+    # the spec-only Identifiable/Referable (not in basyx's enum) are omitted.
+    type_: Literal[
+        "",
+        "AnnotatedRelationshipElement",
+        "AssetAdministrationShell",
+        "BasicEventElement",
+        "Blob",
+        "Capability",
+        "ConceptDescription",
+        "DataElement",
+        "Entity",
+        "EventElement",
+        "File",
+        "FragmentReference",
+        "GlobalReference",
+        "MultiLanguageProperty",
+        "Operation",
+        "Property",
+        "Range",
+        "ReferenceElement",
+        "RelationshipElement",
+        "Submodel",
+        "SubmodelElement",
+        "SubmodelElementCollection",
+        "SubmodelElementList",
+    ] = ""
     value: str = ""
 
     @model_validator(mode="before")
@@ -625,14 +605,64 @@ class Reference(BaseModel):
         return self
 
 
+# KeyTypes that may start a ModelReference (AASd-123 — the first key must
+# reference an Identifiable).
+_AAS_IDENTIFIABLE_KEY_TYPES = frozenset({
+    "AssetAdministrationShell", "ConceptDescription", "Submodel",
+})
+
+# KeyTypes that may follow the first key of a ModelReference — the
+# "fragmented" element types (AAS fragment keys).  GlobalReference /
+# FragmentReference are external markers, not model-element references.
+_AAS_FRAGMENT_KEY_TYPES = frozenset({
+    "AnnotatedRelationshipElement", "BasicEventElement", "Blob", "Capability",
+    "DataElement", "Entity", "EventElement", "File", "MultiLanguageProperty",
+    "Operation", "Property", "Range", "ReferenceElement",
+    "RelationshipElement", "SubmodelElement", "SubmodelElementCollection",
+    "SubmodelElementList",
+})
+
+
 class ModelReference(Reference):
     """A Reference to a model element of the same or another AAS."""
     type_: Literal["ModelReference"] = "ModelReference"
+
+    @model_validator(mode="after")
+    def _check_model_reference_keys(self) -> Any:
+        """Enforce ModelReference key structure (AASd-123): the first key must
+        reference an Identifiable, the rest must be fragment element types.
+        Empty (unset) placeholder keys are skipped."""
+        keys = [k for k in self.key if k.type_]
+        if not keys:
+            return self
+        assert keys[0].type_ in _AAS_IDENTIFIABLE_KEY_TYPES, (
+            "The first key of a ModelReference must be an Identifiable "
+            f"(AssetAdministrationShell/ConceptDescription/Submodel), got {keys[0].type_!r}"
+        )
+        for k in keys[1:]:
+            assert k.type_ in _AAS_FRAGMENT_KEY_TYPES, (
+                "Keys after the first of a ModelReference must be fragment "
+                f"element types, got {k.type_!r}"
+            )
+        return self
 
 
 class ExternalReference(Reference):
     """A Reference to an external entity (outside the AAS)."""
     type_: Literal["ExternalReference"] = "ExternalReference"
+
+    @model_validator(mode="after")
+    def _check_external_reference_keys(self) -> Any:
+        """An ExternalReference must have exactly one GlobalReference key.
+        Empty (unset) placeholder keys are skipped."""
+        keys = [k for k in self.key if k.type_]
+        if not keys:
+            return self
+        assert len(keys) == 1 and keys[0].type_ == "GlobalReference", (
+            "An ExternalReference must have exactly one GlobalReference key, "
+            f"got {[k.type_ for k in keys]!r}"
+        )
+        return self
 
 
 class ReferenceElement(SubmodelElement):
@@ -764,13 +794,47 @@ def _infer_model_type(d: dict) -> str:
     return "Property"
 
 
+class _UnknownFieldError(ValueError):
+    """Raised by ``_build_element`` when a dict names a field the target
+    class does not define — a config/model mistake that must fail LOUDLY
+    rather than be swallowed by the coercion fallbacks (which only exist to
+    tolerate wrong element *types*, not wrong *field names*)."""
+
+
+_UNKNOWN_FIELD_MARK = "Unknown field(s)"
+
+
+def _is_unknown_field_error(e: Exception) -> bool:
+    """True when *e* is a config-mistake error: a bare ``_UnknownFieldError``
+    or a pydantic ``ValidationError`` that wraps one (a before-validator
+    raising it inside ``cls(**d)`` gets converted into a ValidationError, so
+    the coercion fallbacks must recognize the wrapped form too and NOT
+    swallow it — falling through to a nonsense type inference would only
+    produce a misleading error)."""
+    if isinstance(e, _UnknownFieldError):
+        return True
+    return _UNKNOWN_FIELD_MARK in str(e)
+
+
 def _build_element(cls: type, d: dict) -> Any:
     """Build an element instance from a normalized dict, recursing into
     container children."""
     d = dict(d)
-    # Drop non-field keys (e.g. AAS JSON "modelType" → model_type) — they are
-    # not model fields and ``extra="forbid"`` would reject them.
+    # Reject unknown keys LOUDLY — a dict that names something the class does
+    # not define is a config/model mistake, not something to silently drop
+    # (silent drops hid real schema bugs before).  Only the dump / AAS-JSON
+    # discriminators that are deliberately not model fields are tolerated:
+    # ``modelType``/``model_type`` (our own ``_tag_dump`` tags, resolved into
+    # the concrete class before we get here) and ``category`` (basyx AAS JSON
+    # may carry it, the model does not model it).
     fields = set(cls.model_fields)
+    unknown = set(d) - fields
+    tolerated = {"modelType", "model_type", "category"}
+    if unknown - tolerated:
+        raise _UnknownFieldError(
+            f"Unknown field(s) {sorted(unknown - tolerated)} for "
+            f"{cls.__name__} — allowed: {sorted(fields)}"
+        )
     d = {k: v for k, v in d.items() if k in fields}
     if issubclass(cls, MultiLanguageProperty):
         d = dict(d)
@@ -793,22 +857,20 @@ def _build_element(cls: type, d: dict) -> Any:
             ]
     elif issubclass(cls, (SubmodelElementCollection, Submodel, Entity)):
         d = dict(d)
-        if issubclass(cls, Submodel):
-            container = "submodel_element"
-        elif issubclass(cls, Entity):
-            container = "statements"
-        else:
-            container = "value"
-        kids = d.get(container) or []
-        if isinstance(kids, list):
-            # AAS JSON lists children — convert to id_short-keyed dict (the
-            # container's validators then coerce each child with its proper
-            # target type; raw dicts stay raw here).
-            d[container] = {
-                (c.get("id_short") or c.get("idShort") or _PlaceholderId.next()): c
-                for c in kids
-                if isinstance(c, dict)
-            }
+        # AAS JSON lists children (``value``/``statements``/
+        # ``submodel_element`` as a LIST) — convert to id_short-keyed dicts.
+        # Named-field style: the key is only ever injected when it is already
+        # present in the dict (a list of children); containers now declare
+        # their children as named fields / named Dict maps, so there is no
+        # base container field to populate unconditionally.
+        for container in ("submodel_element", "statements", "value"):
+            kids = d.get(container)
+            if isinstance(kids, list):
+                d[container] = {
+                    (c.get("id_short") or c.get("idShort") or _PlaceholderId.next()): c
+                    for c in kids
+                    if isinstance(c, dict)
+                }
     return cls(**d)
 
 
@@ -871,12 +933,33 @@ def coerce_submodel_element(
 
     concrete = _concrete_element_targets(target_type)
     if concrete:
-        # specialized container — build exactly this element type (type safety)
+        # The field's declared type is authoritative for typed fields, but a
+        # ``modelType`` discriminator naming a *subclass* of it wins (a
+        # subclass-specialized override, e.g. ExtendedSkills vs Skills).  A
+        # modelType naming an unrelated same-named class (AID's ``Type`` vs
+        # CCI's ``Type`` — the registry is keyed by bare class name) is
+        # ignored so the declared type is used.
+        mt = d.get("model_type")
+        mt_cls = _ELEMENT_CLASS_REGISTRY.get(mt) if mt else None
+        if mt_cls is not None and any(
+            mt_cls is c or issubclass(mt_cls, c) for c in concrete
+        ):
+            concrete = [mt_cls]
+        if len(concrete) == 1:
+            # A single declared type is authoritative — surface build errors
+            # LOUDLY (a config mistake must not be hidden behind a raw-dict
+            # extra_forbidden cascade).
+            return _build_element(concrete[0], d)
+        last_unknown = None
         for cls in concrete:
             try:
                 return _build_element(cls, d)
-            except Exception:
-                continue
+            except Exception as e:
+                if _is_unknown_field_error(e):
+                    last_unknown = e
+                # else: wrong element type — try the next candidate
+        if last_unknown is not None:
+            raise last_unknown
         return value
 
     # generic container (Dict[str, SubmodelElement]) — a dump's ``modelType``
@@ -888,55 +971,64 @@ def coerce_submodel_element(
         if cls is not None:
             try:
                 return _build_element(cls, d)
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_unknown_field_error(e):
+                    raise
     sid = d.get("semantic_id")
     if isinstance(sid, str) and sid:
         cls = _resolve_semantic_id_cls(sid)
         if cls is not None:
             try:
                 return _build_element(cls, d)
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_unknown_field_error(e):
+                    raise
     mt = _infer_model_type(d)
     cls = _ELEMENT_CLASS_REGISTRY.get(mt) or _ELEMENT_TYPE_BY_MODELTYPE.get(mt)
     if cls is None:
         return value
     try:
         return _build_element(cls, d)
-    except Exception:
+    except Exception as e:
+        if _is_unknown_field_error(e):
+            raise
         return value
 
 
 def _coerce_container_data(cls: Any, data: Any) -> Any:
-    """model_validator(mode='before') helper: coerce raw dicts inside the
-    ``value`` / ``submodel_element`` / ``statements`` containers.
+    """model_validator(mode='before') helper: coerce raw dicts inside ANY
+    dynamic container field.
 
-    Values-model fields (``value: MyValues``) are left to pydantic — the
-    values model's own ``coerce_values`` before-validator coerces each child
-    (with per-field type enforcement) and fills omitted fields from defaults.
+    Named-field style: containers hold their children as DIRECT named fields
+    and/or ``Dict[str, X]`` dynamic maps on any field (e.g. ``Variables.
+    variable``, ``MqttActions.property_name``, ``Endpoints.endpoint``).  Each
+    ``Dict[str, X]`` map is coerced here: every raw dict becomes a concrete
+    element instance (targeted at ``X``, or resolved via the dump's
+    ``modelType`` discriminator when present), so a dump child's concrete
+    subclass (e.g. ``Position`` in ``Dict[str, ParameterItem]``) survives.
 
-    ``Dict[str, X]`` containers (dynamic name-keyed maps, e.g. MQTT actions)
-    and SML ``value`` lists are coerced here: each raw dict becomes a concrete
-    element instance (targeted at ``X`` / the SML's ``item_type``), so a dump
-    child's ``modelType`` discriminator is resolved via the registry."""
+    Values-model fields (legacy ``value: MyValues``) are left to pydantic —
+    the values model's own ``coerce_values`` before-validator coerces each
+    child.  SML ``value`` lists are coerced here too."""
     if isinstance(data, BaseModel):
         data = data.model_dump()
     if not isinstance(data, dict):
         return data
-    for key in ("value", "submodel_element", "statements"):
+    for key, field in cls.model_fields.items():
         if key not in data:
             continue
-        field_tp = _resolve_annotation(_field_annotation(cls, key))
-        if isinstance(field_tp, type) and issubclass(field_tp, ContainerValue):
-            continue  # values model — pydantic + its coerce_values handle it
-        item_tp = _container_item_type(_field_annotation(cls, key))
+        if key in ("id_short", "description", "display_name", "semantic_id",
+                   "qualifiers", "supplemental_semantic_ids", "category",
+                   "entity_type", "global_asset_id", "type_value_list_element",
+                   "value_type_list_element", "semantic_id_list_element",
+                   "order_relevant"):
+            continue
+        field_tp = _resolve_annotation(field.annotation)
+        origin = typing.get_origin(field_tp)
+        item_tp = _container_item_type(field_tp)
         val = data[key]
-        if isinstance(val, dict):
-            default_children = cls.model_fields.get(key)
-            default_children = (
-                default_children.default if default_children is not None else None
-            )
+        if origin is dict or (item_tp is not None and isinstance(val, dict)):
+            default_children = field.default if field.default is not None else None
             if isinstance(default_children, dict):
                 merged = dict(val)
                 for dk, dv in default_children.items():
@@ -958,11 +1050,41 @@ def _coerce_container_data(cls: Any, data: Any) -> Any:
                 )
                 for k, v in val.items()
             }
-        elif isinstance(val, list):
+        elif origin in (list, tuple, set) and isinstance(val, list):
             item_tp = getattr(cls, "item_type", None) or item_tp
             data[key] = [
                 coerce_submodel_element(v, target_type=item_tp) for v in val
             ]
+        elif isinstance(val, dict):
+            # Named element field (e.g. ``Position.y``) given as a raw config
+            # dict — coerce via the field's declared type and stamp the field
+            # name as id_short (the single canonical name).  Already-typed
+            # values pass through unchanged.
+            elem_tp = _resolve_annotation(field_tp)
+            if typing.get_origin(elem_tp) is typing.Union:
+                args = [a for a in typing.get_args(elem_tp) if a is not type(None)]
+                if len(args) == 1:
+                    elem_tp = args[0]
+            if isinstance(elem_tp, type) and issubclass(elem_tp, SubmodelElement):
+                # Preserve the field default's metadata (semanticId,
+                # supplemental sids, description, value_type, …) when the
+                # config overrides a named element field with a raw dict —
+                # a field typed with a generic leaf (e.g. ``forms.href:
+                # Property`` whose concept sid lives only on the field
+                # default) would otherwise lose it, and semanticId-based
+                # consumers (back-conversion, semantic extraction) rely on it.
+                # The field default is the deep-merge base; config values win;
+                # id_short stays the canonical field name (stamped below).
+                merged_val = val
+                if isinstance(val, dict):
+                    default = field.default
+                    if default is not None and isinstance(default, SubmodelElement):
+                        base = default.model_dump()
+                        base.pop("id_short", None)
+                        merged_val = {**base, **val}
+                data[key] = coerce_submodel_element(
+                    merged_val, id_short=key, target_type=elem_tp
+                )
     return data
 
 
@@ -981,15 +1103,14 @@ PrimitiveSubmodelElement = int | float | str | bool | bytes
 
 
 class Submodel(HasSemantics, Identifiable):
-    """A Submodel whose children live in ``submodel_element`` (a values model,
-    mirroring basyx ``Submodel.submodel_element`` and the IDTA JSON
-    ``submodelElements`` container).  Subclasses specialise the value as a
-    values model, e.g. ``submodel_element: MySubmodelValues``."""
-    submodel_element: ContainerValue = ContainerValue()
+    """A Submodel whose children are DIRECT named element fields (named-field
+    style) and/or ``Dict[str, X]`` dynamic maps.  The base itself is
+    metadata-only — a bare Submodel is an empty submodel, so every Submodel
+    with children is a subclass that declares them."""
 
-    @field_serializer("submodel_element")
-    def _ser_submodel_element_lossless(self, v, _info):
-        return _dump_container(v)
+    @model_serializer(mode="wrap")
+    def _ser_element_containers(self, handler):
+        return _serialize_element_containers(self, handler)
 
     @model_validator(mode="before")
     @classmethod
@@ -999,15 +1120,15 @@ class Submodel(HasSemantics, Identifiable):
     @model_validator(mode="after")
     def check_submodel_elements(self) -> Any:
         _stamp_container_id_shorts(self)
-        for field_name in self.model_fields:
+        for field_name in type(self).model_fields:
             if field_name in ["id", "id_short", "description", "display_name",
                               "semantic_id", "qualifiers",
                               "supplemental_semantic_ids"]:
                 continue
-            if field_name == "submodel_element":
-                assert isinstance(getattr(self, field_name), (ContainerValue, dict)), \
-                    f"Field {field_name} must be a ContainerValue or Dict"
-                continue
-            assert is_valid_submodel_element(getattr(self, field_name)), \
+            el = getattr(self, field_name)
+            assert is_valid_submodel_element(el), \
                 f"Field {field_name} is not a valid SubmodelElement"
+            # field name == id_short (single canonical name per element).
+            if isinstance(el, SubmodelElement) and el.id_short != field_name:
+                setattr(self, field_name, el.model_copy(update={"id_short": field_name}))
         return self

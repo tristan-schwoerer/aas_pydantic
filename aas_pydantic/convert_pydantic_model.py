@@ -121,8 +121,8 @@ def convert_model_to_submodel(
             continue
 
         attr_value = attribute_info.value
-        # Dict[str, SMC] or values model → inline entries as direct submodel elements
-        if isinstance(attr_value, (dict, aas_model.ContainerValue)):
+        # Dict[str, SMC] map → inline entries as direct submodel elements
+        if isinstance(attr_value, dict):
             submodel_elements.extend(
                 _inline_dict_children(attr_value, field_info=attribute_info.field_info)
             )
@@ -241,10 +241,27 @@ def create_submodel_element(
             if attribute_value.entity_type == "SelfManagedEntity"
             else model.EntityType.CO_MANAGED_ENTITY
         )
-        statements = (
-            _inline_dict_children(attribute_value.statements)
-            if attribute_value.statements else []
-        )
+        statements = []
+        # Named-field style: children are DIRECT named fields (and/or Dict
+        # maps) on the Entity — no ``statements`` container required.
+        smc_attributes = get_attribute_infos(attribute_value)
+        for attribute_info in smc_attributes:
+            if attribute_info.name in ("entity_type", "global_asset_id"):
+                continue
+            attr_value = attribute_info.value
+            if isinstance(attr_value, dict):
+                statements.extend(
+                    _inline_dict_children(
+                        attr_value, field_info=attribute_info.field_info
+                    )
+                )
+                continue
+            sme = create_submodel_element(
+                attribute_info.name, attr_value,
+                field_info=attribute_info.field_info,
+            )
+            if sme:
+                statements.append(sme)
         global_asset_id = attribute_value.global_asset_id or None
         if (
             entity_type is model.EntityType.SELF_MANAGED_ENTITY
@@ -264,7 +281,9 @@ def create_submodel_element(
         )
 
     if isinstance(attribute_value, aas_model.SubmodelElementList):
-        sml = create_submodel_element_list(attribute_name, attribute_value.value, field_info)
+        sml = create_submodel_element_list(
+            attribute_name, attribute_value.value, field_info, sml=attribute_value
+        )
         q, s, d, dn = _model_metadata(attribute_value)
         sml_sid = get_semantic_id(attribute_value)
         if sml_sid: sml.semantic_id = sml_sid
@@ -450,9 +469,8 @@ def _inline_dict_children(
 ) -> list:
     """Convert a container's children to named BaSyx elements.
 
-    Accepts either a ``Dict[str, AnySubmodelElement]`` (dynamic name-keyed
-    map) or a ``ContainerValue`` values model (each field is a child).  The
-    dict key / field name becomes the id_short of the corresponding child.
+    Accepts a ``Dict[str, AnySubmodelElement]`` (dynamic name-keyed map) whose
+    keys become the id_shorts of the children.
 
     Works for any AAS element type: Property, Range, Operation,
     SubmodelElementCollection, SubmodelElementList, MultiLanguageProperty, etc.
@@ -460,46 +478,7 @@ def _inline_dict_children(
     The key always wins as the authoritative id_short (overrides any id_short
     already set on the model instance).
     """
-    if isinstance(attr_value, aas_model.ContainerValue):
-        try:
-            hints = typing.get_type_hints(type(attr_value), include_extras=True)
-        except Exception:
-            hints = {}
-        items = []
-        for n in attr_value.model_fields:
-            v = getattr(attr_value, n)
-            if isinstance(v, dict):
-                # multi-cardinality map (Dict[str, Element]) — each named child
-                # becomes a direct basyx child (key = id_short).  A bare
-                # base-class entry (e.g. ``Property`` in ``Dict[str, Mode]``)
-                # is upcast to the field's element class so the concept
-                # semanticId carried by the class reaches basyx.
-                item_cls = _dict_item_type(hints.get(n))
-                for k, el in v.items():
-                    if (
-                        item_cls is not None
-                        and isinstance(el, aas_model.SubmodelElement)
-                        and not isinstance(el, item_cls)
-                    ):
-                        coerced = aas_model.coerce_submodel_element(
-                            el, id_short=k, target_type=item_cls
-                        )
-                        if coerced is not el:
-                            el = coerced
-                    items.append((k, el))
-            elif (
-                isinstance(v, (list, tuple))
-                and v
-                and isinstance(v[0], aas_model.SubmodelElement)
-            ):
-                # nested element list field (e.g. CCI term lists) — flatten
-                # with positional id_shorts.
-                for i, el in enumerate(v):
-                    items.append((f"{n}_{i}", el))
-            else:
-                items.append((n, v))
-        items += list((getattr(attr_value, "__pydantic_extra__", None) or {}).items())
-    elif isinstance(attr_value, dict):
+    if isinstance(attr_value, dict):
         items = list(attr_value.items())
     else:
         items = []
@@ -529,8 +508,8 @@ def create_submodel_element_collection(
 
         attr_value = attribute_info.value
 
-        # Dict[str, SMC] or values model → inline entries as direct children
-        if isinstance(attr_value, (dict, aas_model.ContainerValue)):
+        # Dict[str, SMC] map → inline entries as direct children
+        if isinstance(attr_value, dict):
             value.extend(
                 _inline_dict_children(attr_value, field_info=attribute_info.field_info)
             )
@@ -581,9 +560,40 @@ def create_submodel_element_collection(
     return smc
 
 
+# pydantic element class (or subclass) → basyx model class, for declaring an
+# SML's ``type_value_list_element`` from its ``item_type`` when the list is
+# empty (template example items are no longer pre-populated).
+_AAS_TO_BASYX_ELEMENT = (
+    (aas_model.Property, model.Property),
+    (aas_model.MultiLanguageProperty, model.MultiLanguageProperty),
+    (aas_model.Range, model.Range),
+    (aas_model.ReferenceElement, model.ReferenceElement),
+    (aas_model.RelationshipElement, model.RelationshipElement),
+    (aas_model.File, model.File),
+    (aas_model.Blob, model.Blob),
+    (aas_model.Capability, model.Capability),
+    (aas_model.Operation, model.Operation),
+    (aas_model.Entity, model.Entity),
+    (aas_model.SubmodelElementCollection, model.SubmodelElementCollection),
+    (aas_model.SubmodelElementList, model.SubmodelElementList),
+)
+
+
+def _aas_cls_to_basyx(cls) -> Optional[type]:
+    """The basyx model class for a pydantic element class (or subclass), or
+    ``None`` when *cls* is not a concrete element type."""
+    if not isinstance(cls, type):
+        return None
+    for aas_cls, basyx_cls in _AAS_TO_BASYX_ELEMENT:
+        if issubclass(cls, aas_cls):
+            return basyx_cls
+    return None
+
+
 def create_submodel_element_list(
     attribute_name: str, value: list | tuple | set,
     field_info=None,  # Optional[FieldInfo] — for list-level AAS metadata
+    sml: Optional[aas_model.SubmodelElementList] = None,
 ) -> model.SubmodelElementList:
     submodel_elements = []
     submodel_element_ids = OrderedDict()
@@ -619,8 +629,17 @@ def create_submodel_element_list(
         value_type_list_element = None
         type_value_list_element = type(submodel_elements[0])
     else:
-        value_type_list_element = convert_primitive_type_to_xsdtype(str)
-        type_value_list_element = model.Property
+        # Empty list — declare the item type from the SML class's ``item_type``
+        # (template example items are no longer pre-populated, so there are no
+        # items to infer it from).  Falls back to Property/xs:string.
+        item_cls = getattr(type(sml), "item_type", None) if sml is not None else None
+        mapped = _aas_cls_to_basyx(item_cls)
+        if mapped and mapped is not model.Property:
+            value_type_list_element = None
+            type_value_list_element = mapped
+        else:
+            value_type_list_element = convert_primitive_type_to_xsdtype(str)
+            type_value_list_element = model.Property
     if isinstance(value, set):
         ordered = False
         iterable_type = "set"
@@ -684,7 +703,10 @@ def create_blob(attribute_value: aas_model.Blob) -> Optional[model.Blob]:
             else None
         ),
         display_name=convert_util.get_basyx_display_name_from_model(attribute_value),
-        semantic_id=attribute_value.semantic_id,
+        # Mirror create_file: the pydantic ``semantic_id`` is a plain string —
+        # basyx needs an ExternalReference (a raw string serializes to an
+        # invalid ``"semanticId": "..."`` and is rejected by the AAS server).
+        semantic_id=get_semantic_id(attribute_value),
         content_type=attribute_value.content_type,
         value=attribute_value.value,
     )

@@ -1,5 +1,5 @@
 from aas_pydantic.aas_model import (
-    AAS, Blob, Capability, ContainerValue, Entity, ExternalReference, File, Key,
+    AAS, Blob, Capability, Entity, ExternalReference, File, Key,
     ModelReference, MultiLanguageProperty, Operation,
     Property, Qualifier, Range, Reference, ReferenceElement, RelationshipElement,
     Submodel, SubmodelElement, SubmodelElementCollection, SubmodelElementList, Cardinality

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import logging
 import typing
 from pydantic import BaseModel, TypeAdapter
 
-logger = logging.getLogger(__name__)
-
-from aas_pydantic import aas_model, convert_aas_template, convert_util
+from aas_pydantic import aas_model, convert_util
 from basyx.aas import model
 
 
@@ -228,14 +225,23 @@ def get_initial_dict_for_model_instantiation(
 
 
 def _is_container_style_model(model_type, container_key: str) -> bool:
-    """True when a model holds its children in a ``Dict[str, X]`` container
-    field (``value`` / ``submodel_element``) rather than named fields."""
+    """True when a model holds its children in ``Dict[str, X]`` container
+    fields (the *container_key* and/or other name-keyed maps) rather than
+    named element fields."""
     if not (isinstance(model_type, type) and issubclass(model_type, BaseModel)):
         return False
-    return not any(
-        f not in convert_util.META_FIELDS and f != container_key
-        for f in model_type.model_fields
-    )
+    try:
+        hints = typing.get_type_hints(model_type, include_extras=True)
+    except Exception:
+        hints = {k: v.annotation for k, v in model_type.model_fields.items()}
+    for f, ann in hints.items():
+        if f in convert_util.META_FIELDS or f == container_key:
+            continue
+        if typing.get_origin(ann) is typing.ClassVar:
+            continue  # VERSION/REVISION ClassVars are not children
+        if typing.get_origin(ann) is not dict:
+            return False
+    return True
 
 
 def _resolve_element_cls(
@@ -349,6 +355,161 @@ def _multi_element_cls(values_cls, field: str):
     return None
 
 
+def _unwrap_optional(ann):
+    """Strip ``Optional[...]`` / ``Union[..., None]`` wrappers from an
+    annotation, returning the single contained type (or *ann* unchanged)."""
+    if typing.get_origin(ann) is typing.Union:
+        args = [a for a in typing.get_args(ann) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return ann
+
+
+def _has_direct_element_fields(cls) -> bool:
+    """True when *cls* carries leaf children as DIRECT named element fields
+    (e.g. handwritten ``VariableItem`` with ``variable``/``interface_reference``)
+    rather than inside a ``value`` values model / pure Dict container."""
+    try:
+        hints = typing.get_type_hints(cls, include_extras=True)
+    except Exception:
+        hints = {k: v.annotation for k, v in cls.model_fields.items()}
+    for fname, ann in hints.items():
+        if fname in aas_model._ELEMENT_META_KEYS:
+            continue
+        ann = _unwrap_optional(ann)
+        if isinstance(ann, type) and issubclass(ann, aas_model.SubmodelElement):
+            return True
+    return False
+
+
+def _container_named_field_data(cls, basyx_children):
+    """Children of an SMC whose leaf children are DIRECT named fields (no
+    values model): route by ``id_short`` to element-typed fields, by
+    semanticId to ``Dict[str, E]`` fields (nested children), remainder flat by
+    id_short."""
+    try:
+        hints = typing.get_type_hints(cls, include_extras=True)
+    except Exception:
+        hints = {k: v.annotation for k, v in cls.model_fields.items()}
+    element_fields = {}
+    for fname, ann in hints.items():
+        if fname in aas_model._ELEMENT_META_KEYS:
+            continue
+        ann = _unwrap_optional(ann)
+        if isinstance(ann, type) and issubclass(ann, aas_model.SubmodelElement):
+            element_fields[fname] = ann
+    dict_fields = _multi_fields_by_sid(cls)
+    out = {}
+    for c in basyx_children:
+        named = element_fields.get(c.id_short)
+        if named is not None:
+            out[c.id_short] = _container_element_to_pydantic(c, expected_cls=named)
+            continue
+        sid = convert_util.get_semantic_id_value_of_model(c)
+        fields = dict_fields.get(sid) or []
+        if len(fields) == 1:
+            elem_cls = _multi_element_cls(cls, fields[0])
+            out.setdefault(fields[0], {})[c.id_short] = _container_element_to_pydantic(
+                c, expected_cls=elem_cls
+            )
+        else:
+            out[c.id_short] = _container_element_to_pydantic(c)
+    return out
+
+
+def _best_fit_subclass(cls, basyx_el):
+    """A registered subclass of *cls* whose DIRECT named element fields match
+    the basyx element's children (structural best-fit).
+
+    Recovers concrete container subclasses (e.g. ``Position`` living in a
+    ``Dict[str, ParameterItem]``) when the element's semanticId is a
+    config-supplied value not registered to any class — the semanticId can
+    therefore not resolve the concrete type, but the child id_shorts can.
+    The class matching the most child fields wins; ``None`` when nothing
+    fits."""
+    if not isinstance(basyx_el, (model.Entity, model.SubmodelElementCollection)):
+        return None
+    children = {
+        c.id_short
+        for c in (
+            basyx_el.value
+            if isinstance(basyx_el, model.SubmodelElementCollection)
+            else basyx_el.statement
+        )
+    }
+    if not children:
+        return None
+    # Direct element field names of the (base) class — the subclass must ADD
+    # element fields beyond these (e.g. Position adds x/y/yaw over
+    # ParameterItem); inherited/overridden base fields are not distinguishing.
+    base_names = _direct_element_field_names(cls)
+    best = None
+    best_count = -1
+    for classes in aas_model._SEMANTIC_ID_REGISTRY.values():
+        for cand in classes if isinstance(classes, list) else [classes]:
+            if cand is cls or not issubclass(cand, cls):
+                continue
+            names = _direct_element_field_names(cand)
+            added = names - base_names
+            if not added or not added <= children or len(added) <= best_count:
+                continue
+            best = cand
+            best_count = len(added)
+    return best
+
+
+def _direct_element_field_names(cls):
+    """Direct (named) SubmodelElement-typed field names of *cls* (meta keys
+    excluded, Optional unwrapped)."""
+    try:
+        hints = typing.get_type_hints(cls, include_extras=True)
+    except Exception:
+        hints = {k: v.annotation for k, v in cls.model_fields.items()}
+    names = set()
+    for fname, ann in hints.items():
+        if fname in aas_model._ELEMENT_META_KEYS:
+            continue
+        ann = _unwrap_optional(ann)
+        if isinstance(ann, type) and issubclass(ann, aas_model.SubmodelElement):
+            names.add(fname)
+    return names
+
+
+def _container_data_for(basyx_el, cls):
+    """Pydantic data dict for a container element *cls* (SMC/Entity) in the
+    named-field style: children map to the DIRECT named fields, nested
+    children route into the ``Dict[str, E]`` fields; pure Dict containers
+    (no direct fields) route children into their OWN named ``Dict[str, E]``
+    map(s) by concept semanticId (or, for a genuinely generic base container
+    with no map of its own, the base ``value``/``statements`` fallback)."""
+    if isinstance(basyx_el, model.Entity):
+        data = {
+            **_element_meta(basyx_el),
+            "entity_type": (
+                "SelfManagedEntity"
+                if basyx_el.entity_type is model.EntityType.SELF_MANAGED_ENTITY
+                else "CoManagedEntity"
+            ),
+            "global_asset_id": basyx_el.global_asset_id or "",
+        }
+        if _has_direct_element_fields(cls):
+            data.update(_container_named_field_data(cls, basyx_el.statement))
+        else:
+            data.update(_container_children_data(basyx_el.statement, cls))
+        return data
+    if isinstance(basyx_el, model.SubmodelElementCollection):
+        if _has_direct_element_fields(cls):
+            return {
+                **_element_meta(basyx_el),
+                **_container_named_field_data(cls, basyx_el.value),
+            }
+        return {
+            **_element_meta(basyx_el),
+            **_container_children_data(basyx_el.value, cls),
+        }
+    return None
+
+
 def _multi_key_type(values_cls, field: str):
     """Key type (int/str) of a ``Dict[K, E]`` multi field, else ``str``."""
     try:
@@ -370,14 +531,36 @@ def _dict_id_short_to_key(id_short, key_type):
     return id_short
 
 
+def _sole_dict_field(values_cls):
+    """The single ``Dict[str, E]`` field of *values_cls* (a pure Dict
+    container), or ``None`` when there is none / several.  Named-field
+    style: every container declares its own map(s) — there are no base
+    ``value``/``submodel_element``/``statements`` fallbacks anymore."""
+    if values_cls is None:
+        return None
+    try:
+        hints = typing.get_type_hints(values_cls, include_extras=True)
+    except Exception:
+        hints = {k: v.annotation for k, v in values_cls.model_fields.items()}
+    fields = []
+    for fname, ann in hints.items():
+        if fname in convert_util.META_FIELDS:
+            continue
+        if typing.get_origin(ann) is dict:
+            fields.append(fname)
+    return fields[0] if len(fields) == 1 else None
+
+
 def _container_children_data(basyx_children, values_cls):
     """Group converted basyx children back into the container's values model:
     children are routed to the ``Dict[str, E]`` field whose element class
     carries the child's semanticId (group-then-convert: the field's element
     class is used as the conversion target, so shared semanticIds like CCI/CCT
     ``Skill`` still resolve to the right type).  Unmatched children keep
-    ``id_short`` as the field name."""
+    ``id_short`` as the field name — or, when the container is a pure
+    ``Dict[str, E]`` map (a single Dict field), land in that map."""
     by_sid = _multi_fields_by_sid(values_cls)
+    sole_field = _sole_dict_field(values_cls)
     out = {}
     for c in basyx_children:
         sid = convert_util.get_semantic_id_value_of_model(c)
@@ -410,7 +593,7 @@ def _container_children_data(basyx_children, values_cls):
             if field is None:
                 field = fields[0]
         else:
-            field = None
+            field = sole_field  # pure Dict container — the map holds children
         if field is not None:
             elem_cls = _multi_element_cls(values_cls, field)
             converted = _container_element_to_pydantic(c, expected_cls=elem_cls)
@@ -419,65 +602,6 @@ def _container_children_data(basyx_children, values_cls):
         else:
             out[c.id_short] = _container_element_to_pydantic(c)
     return out
-
-
-def _generic_container_element_to_pydantic(
-    basyx_el: model.SubmodelElement,
-    expected_cls=None,
-) -> aas_model.SubmodelElement:
-    """Fallback: convert a basyx element into a generic container-style
-    pydantic element (children live in ``value`` / ``statements`` dicts)."""
-    if isinstance(basyx_el, model.Entity):
-        return aas_model.Entity(
-            id_short=basyx_el.id_short,
-            description=convert_util.get_str_description(basyx_el.description),
-            display_name=convert_util.get_str_display_name(
-                getattr(basyx_el, "display_name", None)
-            ),
-            semantic_id=convert_util.get_semantic_id_value_of_model(basyx_el),
-            entity_type=(
-                "SelfManagedEntity"
-                if basyx_el.entity_type is model.EntityType.SELF_MANAGED_ENTITY
-                else "CoManagedEntity"
-            ),
-            global_asset_id=basyx_el.global_asset_id or "",
-            statements={
-                c.id_short: _container_element_to_pydantic(c, expected_cls)
-                for c in basyx_el.statement
-            },
-        )
-    if isinstance(basyx_el, model.SubmodelElementCollection):
-        return aas_model.SubmodelElementCollection(
-            id_short=basyx_el.id_short,
-            description=convert_util.get_str_description(basyx_el.description),
-            display_name=convert_util.get_str_display_name(
-                getattr(basyx_el, "display_name", None)
-            ),
-            semantic_id=convert_util.get_semantic_id_value_of_model(basyx_el),
-            value={
-                c.id_short: _container_element_to_pydantic(c, expected_cls)
-                for c in basyx_el.value
-            },
-        )
-    if isinstance(basyx_el, model.SubmodelElementList):
-        items = []
-        item_cls = getattr(expected_cls, "item_type", None) if expected_cls else None
-        for c in basyx_el.value:
-            if isinstance(c, model.SubmodelElementCollection):
-                # restore the real id_short and drop the AASd-120 temp
-                # attribute — non-mutating so the source store stays intact
-                c = convert_util.unpatched_id_short_smc_copy(c)
-            items.append(_container_element_to_pydantic(c, item_cls))
-        return aas_model.SubmodelElementList(
-            id_short=basyx_el.id_short,
-            description=convert_util.get_str_description(basyx_el.description),
-            display_name=convert_util.get_str_display_name(
-                getattr(basyx_el, "display_name", None)
-            ),
-            semantic_id=convert_util.get_semantic_id_value_of_model(basyx_el),
-            value=items,
-        )
-    return get_submodel_element_value(basyx_el, None)
 
 
 def _container_element_to_pydantic(
@@ -491,26 +615,8 @@ def _container_element_to_pydantic(
     cls = _resolve_element_cls(basyx_el, expected_cls)
     if cls is None:
         return get_submodel_element_value(basyx_el, None)
-    if isinstance(basyx_el, model.Entity):
-        data = {
-            **_element_meta(basyx_el),
-            "entity_type": (
-                "SelfManagedEntity"
-                if basyx_el.entity_type is model.EntityType.SELF_MANAGED_ENTITY
-                else "CoManagedEntity"
-            ),
-            "global_asset_id": basyx_el.global_asset_id or "",
-            "statements": _container_children_data(
-                basyx_el.statement, _resolve_values_cls(cls, "statements")
-            ),
-        }
-    elif isinstance(basyx_el, model.SubmodelElementCollection):
-        data = {
-            **_element_meta(basyx_el),
-            "value": _container_children_data(
-                basyx_el.value, _resolve_values_cls(cls, "value")
-            ),
-        }
+    if isinstance(basyx_el, (model.Entity, model.SubmodelElementCollection)):
+        data = _container_data_for(basyx_el, cls)
     elif isinstance(basyx_el, model.SubmodelElementList):
         items = []
         item_cls = getattr(cls, "item_type", None)
@@ -535,18 +641,26 @@ def _container_element_to_pydantic(
         data = get_submodel_element_value(basyx_el, None).model_dump()
     try:
         return cls(**data)
-    except Exception as e:  # noqa: BLE001 — a failed typed build degrades to a
-        # generic container, but it must be visible (silent fallbacks hide
-        # real schema bugs).
-        logger.warning(
-            "Typed build of %s(%s) failed (%s: %s) — falling back to a generic "
-            "container; the round trip is lossy for this element.",
-            cls.__name__,
-            getattr(basyx_el, "id_short", "?"),
-            type(e).__name__,
-            e,
-        )
-        return _generic_container_element_to_pydantic(basyx_el, expected_cls)
+    except Exception as e:  # noqa: BLE001 — before failing, try a registered
+        # subclass whose DIRECT named fields match the children (e.g. Position
+        # for a ``Dict[str, ParameterItem]`` whose semanticId the config
+        # overrode).  If that does not fit either, FAIL LOUDLY — a container
+        # that no registered pydantic class can represent is a modeling
+        # mistake, not something to degrade into a lossy generic container.
+        better = _best_fit_subclass(cls, basyx_el)
+        if better is not None:
+            try:
+                return better(**(_container_data_for(basyx_el, better) or data))
+            except Exception:
+                pass
+        sid = convert_util.get_semantic_id_value_of_model(basyx_el)
+        raise ValueError(
+            f"Cannot back-convert container '{getattr(basyx_el, 'id_short', '?')}' "
+            f"(modelType={type(basyx_el).__name__}, semanticId={sid or '(none)'}): "
+            f"no registered pydantic class represents it and the typed build of "
+            f"{cls.__name__} failed ({type(e).__name__}: {e}). "
+            f"Back-conversion only supports content modeled by the pydantic classes."
+        ) from e
 
 
 def convert_submodel_to_model_instance(
@@ -563,14 +677,30 @@ def convert_submodel_to_model_instance(
         aas_model.Submodel: Pydantic model of the submodel.
     """
     if model_type is None:
-        model_type = convert_aas_template.convert_submodel_template_to_pydatic_type(sm)
+        raise ValueError(
+            "convert_submodel_to_model_instance requires model_type — pass the "
+            "pydantic Submodel class.  (Legacy template inference from a basyx "
+            "Submodel was removed: back-conversion only supports content "
+            "modeled by the pydantic classes, which are constructed from the "
+            "JSON config templates.)"
+        )
     dict_model_instantiation = get_initial_dict_for_model_instantiation(sm)
 
+    if _has_direct_element_fields(model_type):
+        # Named-field Submodel — children map to direct named fields and
+        # ``Dict[str, E]`` maps by concept semanticId (named-field style).
+        dict_model_instantiation.update(
+            _container_named_field_data(model_type, sm.submodel_element)
+        )
+        return TypeAdapter(model_type).validate_python(dict_model_instantiation)
+
     if _is_container_style_model(model_type, "submodel_element"):
-        # Container-style Submodel — children populate submodel_element, grouped
-        # back into multi-cardinality Dict fields by concept semanticId.
-        dict_model_instantiation["submodel_element"] = _container_children_data(
-            sm.submodel_element, _resolve_values_cls(model_type, "submodel_element")
+        # Container-style Submodel — children populate its ``Dict[str, X]``
+        # field(s), grouped back into multi-cardinality maps by concept
+        # semanticId (named-field style: ``Variables.variable``,
+        # ``Parameters.parameter``, or the base ``submodel_element`` fallback).
+        dict_model_instantiation.update(
+            _container_children_data(sm.submodel_element, model_type)
         )
         return TypeAdapter(model_type).validate_python(dict_model_instantiation)
 

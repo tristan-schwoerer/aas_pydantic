@@ -64,8 +64,39 @@ def field_name(name: str) -> str:
     return s
 
 
+def to_camel(name: str) -> str:
+    """CamelCase a (snake_case) id_short for a dedicated leaf class name:
+    ``year_of_construction`` → ``YearOfConstruction``, ``u_r_i_of_the_product``
+    → ``URIOfTheProduct``.  The class name therefore never equals the
+    snake_case field name (pydantic rejects field==annotation self-refs), and
+    each element's template defaults live on its own named class."""
+    parts = re.split(r"[^0-9a-zA-Z]+", name or "")
+    return "".join(p[:1].upper() + p[1:] for p in parts if p)
+
+
+def sid_namespace_suffix(base_name: str, sid: str) -> str:
+    """Readable disambiguation suffix for a class whose id_short collides with
+    another element of a *different* semanticId (e.g. AID's nested object-
+    schema ``properties`` / ``property_name`` under ``json-schema#properties``
+    / ``json-schema#propertyName``).  Prefers the semanticId fragment when it
+    differs from the id_short (``json-schema#propertyName`` →
+    ``property_name_json_schema``); otherwise uses the last namespace path
+    segment (``.../ControlComponent/Skill/Errors/2/0`` → ``Errors_skill``)."""
+    frag = sid.split("#")[-1] if "#" in sid else ""
+    path = [p for p in sid.split("#")[0].split("/") if p and not p.isdigit()]
+    if frag and snake(frag) != snake(base_name):
+        return snake(frag)
+    ns = path if frag else (path[:-1] if path else [])
+    return snake(ns[-1]) if ns else ""
+
+
 _CLASH_RE = re.compile(r"^    (\w+): (\w+) = (\w+)\(")
 _DICT_CLASH_RE = re.compile(r"^    (\w+): Dict\[str, (\w+)\] = \{\}")
+_LAMBDA_CLASH_RE = re.compile(
+    r"^    (\w+): (\w+) = Field\(default_factory=lambda: (\w+)\(\)\)$"
+)
+_OPT_CLASH_RE = re.compile(r"^    (\w+): Optional\[(\w+)\] = None$")
+_REQUIRED_CLASH_RE = re.compile(r"^    (\w+): (\w+)$")
 
 
 def _rewrite_clash_fields(body: list, aliases_emitted: set):
@@ -101,6 +132,51 @@ def _rewrite_clash_fields(body: list, aliases_emitted: set):
             new_body.append(line.replace(
                 f"{t}: Dict[str, {t}] = {{}}",
                 f"{t}: Dict[str, {alias}] = {{}}",
+            ))
+            continue
+        # lazy lambda form produced for fields referencing recursive containers
+        # (e.g. ``properties: properties = Field(default_factory=lambda:
+        # properties())``) — same field-name/type clash, same alias fix.
+        m = _LAMBDA_CLASH_RE.match(line)
+        if m and m.group(1) == m.group(2) == m.group(3):
+            t = m.group(1)
+            alias = f"{t}_t"
+            if alias not in aliases_emitted:
+                aliases_emitted.add(alias)
+                alias_lines.append(f"{alias}: TypeAlias = {t}")
+            new_body.append(line.replace(
+                f"{t}: {t} = Field(default_factory=lambda: {t}())",
+                f"{t}: {alias} = Field(default_factory=lambda: {alias}())",
+            ))
+            continue
+        # optional single-cardinality child whose field name equals its type
+        # annotation (``enum: Optional[enum] = None``) — pydantic resolves the
+        # self-referential name to NoneType, silently dropping the child.
+        m = _OPT_CLASH_RE.match(line)
+        if m and m.group(1) == m.group(2):
+            t = m.group(1)
+            alias = f"{t}_t"
+            if alias not in aliases_emitted:
+                aliases_emitted.add(alias)
+                alias_lines.append(f"{alias}: TypeAlias = {t}")
+            new_body.append(line.replace(
+                f"{t}: Optional[{t}] = None",
+                f"{t}: Optional[{alias}] = None",
+            ))
+            continue
+        # required (no-default) single-cardinality child whose field name equals
+        # its type annotation (``forms: forms``) — same self-reference clash,
+        # same alias fix.
+        m = _REQUIRED_CLASH_RE.match(line)
+        if m and m.group(1) == m.group(2):
+            t = m.group(1)
+            alias = f"{t}_t"
+            if alias not in aliases_emitted:
+                aliases_emitted.add(alias)
+                alias_lines.append(f"{alias}: TypeAlias = {t}")
+            new_body.append(line.replace(
+                f"{t}: {t}",
+                f"{t}: {alias}",
             ))
             continue
         new_body.append(line)
@@ -183,6 +259,24 @@ def emit_reference(ref: dict, indent: str) -> list:
     return lines
 
 
+def is_placeholder_endpoint(ref) -> bool:
+    """True when a RelationshipElement endpoint is a template placeholder.
+
+    Several templates (e.g. HSEM ``SameAs``) declare ``first``/``second`` as a
+    ``ModelReference`` whose only key is a ``GlobalReference`` "EMPTY" — a
+    ModelReference's FIRST key must be an Identifiable (AASd-123), so such
+    endpoints carry no real target and would make the generated class fail
+    validation at import.  Skip them (endpoints stay unset/None).
+    """
+    if not isinstance(ref, dict):
+        return True
+    if ref.get("type") == "ModelReference":
+        keys = ref.get("keys") or []
+        if keys and keys[0].get("type") == "GlobalReference":
+            return True
+    return False
+
+
 def emit_leaf_instance(el: dict, indent: str) -> list:
     """Source lines constructing a leaf element instance.
 
@@ -196,19 +290,24 @@ def emit_leaf_instance(el: dict, indent: str) -> list:
     sid = extract_semantic_id(el)
     desc = extract_description(el)
     vt = extract_value_type(el)
+    ct = el.get("contentType") or el.get("content_type")
     if sid:
         args.append(f'semantic_id={json.dumps(sid)}')
     if desc:
         args.append(f'description={json.dumps(desc)}')
     if vt and cls in ("Property", "Range"):
         args.append(f'value_type={json.dumps(vt)}')
+    if ct and cls in ("File", "Blob"):
+        # File/Blob need a content type — basyx rejects empty content types
+        # (and the converter drops Blobs without one).
+        args.append(f'content_type={json.dumps(ct)}')
     for i, a in enumerate(args):
         lines.append(f"{indent}    {a}{',' if i < len(args) - 1 else ','}")
     if cls == "RelationshipElement":
         # Endpoints are References in basyx — emit the template's reference.
         for key_name in ("first", "second"):
             ref = el.get(key_name)
-            if isinstance(ref, dict):
+            if isinstance(ref, dict) and not is_placeholder_endpoint(ref):
                 ref_src = emit_reference(ref, indent + "    ")
                 lines.append(f"{indent}    {key_name}=" + ref_src[0].lstrip())
                 lines.extend(ref_src[1:])
@@ -236,48 +335,133 @@ def gen_template(template_path: str, output_dir: str):
     sm = submodels[0]
     sm_name = safe_name(sm["idShort"])
 
+    # ── SemanticId-aware class naming ──
+    # IDTA templates may use one id_short for several distinct element types
+    # distinguished by semanticId (AID: ``properties`` = td#PropertyAffordance
+    # vs json-schema#properties; ``property_name`` = PropertyDefinition vs
+    # json-schema#propertyName; CCT: Type/Errors vs Skill/Errors).  The first
+    # occurrence in document order keeps the plain class name (so every
+    # top-level name stays stable — subclasses like mqtt_aid.py keep working);
+    # later occurrences with a different semanticId get a disambiguated name
+    # via :func:`sid_namespace_suffix`.  All template detail is preserved: the
+    # id_short stays the field name and default instance id_short, and each
+    # distinct semanticId lives on its own class.
+    primary_sid = {}
+
+    def _prescan_primary(el):
+        if not isinstance(el, dict):
+            return
+        nm = safe_name(el.get("idShort", ""))
+        if nm and el.get("modelType") in (
+            "Submodel", "SubmodelElementCollection", "Entity", "SubmodelElementList",
+        ):
+            s = extract_semantic_id(el)
+            if s and nm not in primary_sid:
+                primary_sid[nm] = s
+        for c in children_of(el):
+            _prescan_primary(c)
+
+    _prescan_primary(sm)
+
+    # resolved class name → (base id_short, semanticId); guards uniqueness
+    _name_identity = {}
+
+    def resolve_class_name(base: str, sid: str) -> str:
+        """Class name for an element with id_short *base* and semanticId *sid*:
+        plain name for the primary (document-first) occurrence, disambiguated
+        otherwise.  Deterministic — the same (base, sid) always resolves to the
+        same name, so recursion-stack lookups and definitions agree."""
+        if sid == primary_sid.get(base, sid):
+            cand = base
+        else:
+            suf = sid_namespace_suffix(base, sid)
+            cand = f"{base}_{suf}" if suf else base
+        i = 2
+        c = cand
+        while c in _name_identity and _name_identity[c] != (base, sid):
+            c = f"{cand}_{i}"
+            i += 1
+        _name_identity.setdefault(c, (base, sid))
+        return c
+
     # name → (meta_lines, body_lines); order of definition
     classes = {}
     order = []
-    values_classes = set()
     entity_classes = set()
     sml_classes = set()
     leaf_bases = {}  # dedicated leaf element class name → base (leaf) class name
     _used_leaf_types = {
         "Submodel", "SubmodelElement", "SubmodelElementCollection",
-        "SubmodelElementList", "ContainerValue",
+        "SubmodelElementList",
     }
 
-    def register(name, meta, body, is_values=False, is_entity=False, is_sml=False):
+    def register(name, meta, body, is_entity=False, is_sml=False):
         if name not in classes:
             classes[name] = (meta, body)
             order.append(name)
-            if is_values:
-                values_classes.add(name)
             if is_entity:
                 entity_classes.add(name)
             if is_sml:
                 sml_classes.add(name)
 
-    def dedicated_leaf_cls(c: dict, leaf_cls: str) -> str:
-        """Register (once) a dedicated subclass of *leaf_cls* carrying the
-        element's concept semanticId — e.g. ``class SameAs(RelationshipElement)``
-        with ``semantic_id="https://.../SameAs/1/0"`` — and return its name.
-        This is the proper home for the concept semanticId (the old
-        ``_multi_cardinality`` ClassVar); back-conversion groups Dict-map
-        children by the resolved element class instead of a sid lookup.
+    def _disambiguated_leaf_name(base_name: str, sid: str, leaf_cls: str) -> str:
+        """Unique class name for a leaf whose plain CamelCase name is owned by
+        a DIFFERENT element (same id_short, different semanticId — e.g. CCI's
+        ``Type``: ReferenceElement ``Instance/Type`` vs Property
+        ``Skill/Parameter/Type``).  Uses the semanticId namespace suffix
+        (``Type`` + ``.../Instance/Type/2/0`` → ``Type_instance``), then
+        numeric dedup."""
+        suf = sid_namespace_suffix(base_name, sid) or leaf_cls
+        cand = f"{base_name}_{suf}"
+        i = 2
+        c = cand
+        while c in leaf_bases or c in classes or (
+            c in _name_identity and _name_identity[c] != (base_name, sid)
+        ):
+            c = f"{cand}_{i}"
+            i += 1
+        return c
 
-        Falls back to the generic *leaf_cls* when there is no concept
-        semanticId, the element has no idShort, or the name would shadow the
-        base class or collide with an already-registered class."""
+    def leaf_class_for(c: dict, leaf_cls: str) -> str:
+        """Register (once) a dedicated subclass of *leaf_cls* carrying the
+        element's template defaults — concept semanticId, description,
+        supplemental semanticIds, ``value_type`` (Property/Range),
+        ``content_type`` (File/Blob), and RelationshipElement endpoints —
+        and return its name.
+
+        The class name is the CamelCased id_short (``year_of_construction`` →
+        ``YearOfConstruction``).  Class-level defaults survive ANY construction
+        path (config dict, partial instance, converter) because pydantic
+        validates against the class instead of discarding an instance default.
+
+        A dedicated leaf class is REUSED only when the same (id_short,
+        semanticId, base type) recurs; a same-named leaf with a DIFFERENT
+        semanticId or modelType gets its own disambiguated class (e.g. CCI
+        ``Type`` → ``Type`` Property + ``Type_instance`` ReferenceElement).
+        Falls back to the generic *leaf_cls* only when there is no concept
+        semanticId or the element has no idShort."""
         sid = extract_semantic_id(c)
-        elem_name = safe_name(c.get("idShort", ""))
+        elem_name = to_camel(safe_name(c.get("idShort", "")))
         if not sid or not elem_name or elem_name == leaf_cls:
             return leaf_cls
         if elem_name in leaf_bases:
-            return elem_name  # already registered as a dedicated leaf
-        if elem_name in classes:
-            return leaf_cls  # name taken by a container/other class — fall back
+            # Reuse ONLY the identical (semanticId, base type); otherwise the
+            # plain name belongs to a *different* element's class.
+            existing = _name_identity.get(elem_name)
+            if existing == (elem_name, sid) and leaf_bases[elem_name] == leaf_cls:
+                return elem_name
+            name = _disambiguated_leaf_name(elem_name, sid, leaf_cls)
+        elif elem_name in classes:
+            # Plain name owned by a container — keep the leaf's concept
+            # semanticId on its own disambiguated class instead of degrading
+            # to the generic leaf.
+            name = _disambiguated_leaf_name(elem_name, sid, leaf_cls)
+        else:
+            identity = _name_identity.get(elem_name)
+            if identity is not None and identity != (elem_name, sid):
+                name = _disambiguated_leaf_name(elem_name, sid, leaf_cls)
+            else:
+                name = elem_name
         meta = [f'    semantic_id: str = {json.dumps(sid)}']
         desc = extract_description(c)
         if desc:
@@ -285,36 +469,76 @@ def gen_template(template_path: str, output_dir: str):
         supp = extract_supplemental_semantic_ids(c)
         if supp:
             meta.append(f'    supplemental_semantic_ids: List[str] = {json.dumps(supp)}')
-        register(elem_name, meta, [])
-        leaf_bases[elem_name] = leaf_cls
-        return elem_name
+        vt = extract_value_type(c)
+        if vt and leaf_cls in ("Property", "Range"):
+            meta.append(f'    value_type: str = {json.dumps(vt)}')
+        ct = c.get("contentType") or c.get("content_type")
+        if ct and leaf_cls in ("File", "Blob"):
+            meta.append(f'    content_type: str = {json.dumps(ct)}')
+        if leaf_cls == "RelationshipElement":
+            for key_name in ("first", "second"):
+                ref = c.get(key_name)
+                if isinstance(ref, dict) and not is_placeholder_endpoint(ref):
+                    ref_src = emit_reference(ref, "    ")
+                    ref_cls = ref_src[0].lstrip().rstrip("(").strip()
+                    meta.append(f"    {key_name}: {ref_cls} = " + ref_src[0].lstrip())
+                    meta.extend(ref_src[1:])
+                    meta[-1] = meta[-1] + ","
+        register(name, meta, [])
+        leaf_bases[name] = leaf_cls
+        # Reserve the name so a later container/leaf of the same base id_short
+        # dedups (``SerialNumber_2``) instead of silently shadowing this class.
+        _name_identity.setdefault(name, (elem_name, sid))
+        return name
 
-    def walk(el: dict, container_key: str, stack: tuple = (), name: str = None) -> list:
-        """Register the ``{Name}Values`` class and the ``{Name}`` container
-        class for *el*; returns the values-class body lines (one typed field
-        per child, field name == id_short).
+    def walk(el: dict, stack: tuple = (), name: str = None) -> list:
+        """Register the ``{Name}`` container class for *el* with its children
+        as DIRECT named fields (field name == id_short) — no ``value`` /
+        ``submodel_element`` / ``statements`` wrapper (the standardized
+        containers are abolished).
 
         Children whose template cardinality allows more than one
         (``SMT/Cardinality`` ZeroToMany/OneToMany) become dynamic
-        ``Dict[str, Element]`` maps — MANY instances keyed by name are then
-        possible, exactly like the pre-values-model dicts.
+        ``Dict[str, Element]`` maps — MANY instances keyed by name.
 
         ``name`` overrides the class name (used for SML items whose template
         idShort is missing — falls back to ``{ListName}Item``).  ``stack``
-        holds the class names currently being defined (for detecting
-        recursive children like HSEM ``Node`` containing a ``Node`` — those
-        become empty ``Dict[str, Node]`` maps, so nothing recurses).
+        holds ``(id_short, semanticId, resolved_class_name)`` tuples of the
+        elements currently being defined.  Recursion is detected by the pair
+        (id_short, semanticId) — NOT the bare id_short — so a same-named child
+        of a *different* semanticId (AID's nested object-schema ``properties``)
+        is a real class, not a false recursion.  Recursive multi-cardinality
+        children (HSEM ``Node`` in ``Node``) become empty ``Dict[str, Node]``
+        maps; recursive single-cardinality children (AID's ``property_name`` →
+        ``properties`` → ``property_name``) are optional (``Optional[X] =
+        None``) so nesting stays representable without recursing forever.
+
+        Single-cardinality children obey the template's ``SMT/Cardinality``:
+        ``One`` (or a missing qualifier, which the templates use for mandatory
+        elements) is required with NO default — pydantic rejects a constructed
+        instance that omits it, so a mandatory element must be explicitly
+        configured or the build fails; ``ZeroToOne`` is ``Optional[X] = None``
+        and only present once set.
         """
-        cname = name or safe_name(el.get("idShort", ""))
-        vname = f"{cname}Values"
+        cname = resolve_class_name(name or safe_name(el.get("idShort", "")),
+                                   extract_semantic_id(el))
         mt_el = el.get("modelType", "")
         kids = children_of(el)
+        stack_map = {(b, s): r for b, s, r in stack}
         lines = []
         for c in kids:
             child_name = safe_name(c.get("idShort", ""))
+            child_sid = extract_semantic_id(c)
+            child_resolved = resolve_class_name(child_name, child_sid)
             skey = field_name(c.get("idShort", child_name))  # field = id_short
             mt = c.get("modelType", "")
-            multi = extract_cardinality(c) in _MULTI_CARDINALITY
+            card = extract_cardinality(c)
+            multi = card in _MULTI_CARDINALITY
+            # A missing ``SMT/Cardinality`` qualifier defaults to ``One`` — the
+            # element is mandatory (the only missing-qualifier cases in the
+            # templates are ``forms`` / ``fileName`` / ``definesSecurityScheme``
+            # / ``iolv_payloadMappingElement``).
+            required = card in ("One", None, "")
             if multi:
                 # multi-cardinality → dynamic name-keyed map of this element.
                 # Generic-leaf elements get a dedicated subclass carrying the
@@ -323,52 +547,60 @@ def gen_template(template_path: str, output_dir: str):
                 # resolved element class, so no ``_multi_cardinality`` ClassVar
                 # is needed.
                 if mt in ("SubmodelElementCollection", "Entity"):
-                    if child_name in stack:
+                    if (child_name, child_sid) in stack_map:
                         # recursive child (e.g. HSEM Node in Node) — an empty
                         # Dict[str, <container>] map; no instantiation, so the
                         # default cannot recurse.
-                        lines.append(f"    {skey}: Dict[str, {cname}] = {{}}")
+                        lines.append(
+                            f"    {skey}: Dict[str, {stack_map[(child_name, child_sid)]}] = {{}}"
+                        )
                         continue
-                    child_container = "statements" if mt == "Entity" else "value"
-                    walk(c, child_container, stack + (child_name,))
-                    lines.append(f"    {skey}: Dict[str, {child_name}] = {{}}")
+                    walk(c, stack + ((child_name, child_sid, child_resolved),))
+                    lines.append(f"    {skey}: Dict[str, {child_resolved}] = {{}}")
                 elif mt == "SubmodelElementList":
                     _walk_sml(c, stack)
-                    lines.append(f"    {skey}: Dict[str, {child_name}] = {{}}")
+                    lines.append(f"    {skey}: Dict[str, {child_resolved}] = {{}}")
                 else:
                     leaf_cls = ELEMENT_MAP.get(mt, "Property")
                     _used_leaf_types.add(leaf_cls)
-                    elem_cls = dedicated_leaf_cls(c, leaf_cls)
+                    elem_cls = leaf_class_for(c, leaf_cls)
                     lines.append(f"    {skey}: Dict[str, {elem_cls}] = {{}}")
                 continue
             if mt in ("SubmodelElementCollection", "Entity"):
-                if child_name in stack:
-                    # Recursive single-cardinality child — skip entirely so the
-                    # ancestor's full definition wins and the default doesn't
-                    # recurse forever.
+                if (child_name, child_sid) in stack_map:
+                    # Recursive single-cardinality child (AID object schema:
+                    # ``property_name → properties → property_name``).  These
+                    # are ZeroToOne in the templates — optional, so not
+                    # instantiated unless set (this also breaks the recursion
+                    # cleanly).
+                    rec = stack_map[(child_name, child_sid)]
+                    lines.append(f"    {skey}: Optional[{rec}] = None")
                     continue
-                child_container = "statements" if mt == "Entity" else "value"
-                walk(c, child_container, stack + (child_name,))
-                lines.append(f"    {skey}: {child_name} = {child_name}()")
+                walk(c, stack + ((child_name, child_sid, child_resolved),))
+                if required:
+                    lines.append(f"    {skey}: {child_resolved}")
+                else:
+                    lines.append(f"    {skey}: Optional[{child_resolved}] = None")
             elif mt == "SubmodelElementList":
                 _walk_sml(c, stack)
-                lines.append(f"    {skey}: {child_name} = {child_name}()")
+                if required:
+                    lines.append(f"    {skey}: {child_resolved}")
+                else:
+                    lines.append(f"    {skey}: Optional[{child_resolved}] = None")
             else:
                 leaf_cls = ELEMENT_MAP.get(mt, "Property")
                 _used_leaf_types.add(leaf_cls)
-                leaf_src = emit_leaf_instance(c, "    ")
-                lines.append(f"    {skey}: {leaf_cls} = " + leaf_src[0].lstrip())
-                lines.extend(leaf_src[1:])
+                elem_cls = leaf_class_for(c, leaf_cls)
+                if required:
+                    lines.append(f"    {skey}: {elem_cls}")
+                else:
+                    lines.append(f"    {skey}: Optional[{elem_cls}] = None")
         if not lines:
             lines.append("    pass")
-        # values class: one typed field per child (strict — catches typos)
-        register(
-            vname,
-            ["    model_config = {'extra': 'forbid'}"],
-            lines,
-            is_values=True,
-        )
-        # container class: attributes (semantic_id, ...) + typed value
+        # container class: attributes (semantic_id, ...) + the typed child
+        # fields directly (no ``value``/``submodel_element``/``statements``
+        # wrapper).  Required children have NO default — pydantic enforces they
+        # are provided.
         meta = [f'    semantic_id: str = {json.dumps(extract_semantic_id(el))}']
         desc = extract_description(el)
         if desc:
@@ -385,21 +617,14 @@ def gen_template(template_path: str, output_dir: str):
             gid = el.get("globalAssetId")
             if gid:
                 meta.append(f'    global_asset_id: str = {json.dumps(gid)}')
-        if any(f": {cname}" in l or f": Dict[str, {cname}]" in l for l in lines):
-            # The values class references the container itself (recursive
-            # child) — the default must be built lazily, else the eager
-            # ``= {vname}()`` forces schema construction before the container
-            # class exists (pydantic circular-ref guard).
-            body = [f"    {container_key}: {vname} = Field(default_factory={vname})"]
-        else:
-            body = [f"    {container_key}: {vname} = {vname}()"]
-        register(cname, meta, body, is_entity=is_entity)
+        register(cname, meta, lines, is_entity=is_entity)
         return lines
 
     def _walk_sml(c: dict, stack: tuple):
         """Register an SML class with a typed ``value: List[Item]`` (AASd-108:
         homogeneous lists only — heterogeneous ones start empty)."""
-        cname = safe_name(c.get("idShort", ""))
+        cname = resolve_class_name(safe_name(c.get("idShort", "")),
+                                   extract_semantic_id(c))
         item_kids = children_of(c)
         sub_meta = [f'    semantic_id: str = {json.dumps(extract_semantic_id(c))}']
         desc = extract_description(c)
@@ -408,37 +633,33 @@ def gen_template(template_path: str, output_dir: str):
         supp = extract_supplemental_semantic_ids(c)
         if supp:
             sub_meta.append(f'    supplemental_semantic_ids: List[str] = {json.dumps(supp)}')
-        item_src = []
         item_classes = set()  # for AASd-108 homogeneity check
+        stack_map = {(b, s): r for b, s, r in stack}
         for item in item_kids:
             imt = item.get("modelType", "")
             if imt in ("SubmodelElementCollection", "Entity"):
                 item_name = safe_name(item.get("idShort", f"{cname}Item"))
-                if item_name in stack:
+                item_sid = extract_semantic_id(item)
+                if (item_name, item_sid) in stack_map:
                     # Recursive item — skip entirely.
                     continue
-                item_container = "statements" if imt == "Entity" else "value"
-                walk(item, item_container, stack + (item_name,), name=item_name)
-                item_src.append(
-                    f'{item_name}(id_short={json.dumps(item.get("idShort", item_name))})'
-                )
-                item_classes.add(item_name)
+                item_resolved = resolve_class_name(item_name, item_sid)
+                walk(item, stack + ((item_name, item_sid, item_resolved),),
+                     name=item_name)
+                item_classes.add(item_resolved)
             else:
-                leaf = emit_leaf_instance(item, "        ")
                 leaf_cls = ELEMENT_MAP.get(imt, "Property")
                 _used_leaf_types.add(leaf_cls)
-                item_src.append("\n".join(leaf))
                 item_classes.add(leaf_cls)
-        if item_src and len(item_classes) == 1:
-            # Homogeneous list — safe to pre-populate (AASd-108).
-            # item_type lets back-conversion restore item types even though
-            # AASd-114 strips item semanticIds in basyx.
+        if item_classes and len(item_classes) == 1:
+            # Homogeneous list — declare item_type so back-conversion can
+            # restore item types (AASd-114 strips item semanticIds in basyx),
+            # but start EMPTY: the template's example items are empty
+            # scaffolding and would leak into every generated instance (e.g.
+            # nameplate ``Markings`` carrying an empty ``marking_name`` SMC).
             item_cls = next(iter(item_classes))
             sub_meta.append(f"    item_type: ClassVar = {item_cls}")
-            sml_body = [f"    value: List[{item_cls}] = ["]
-            for s in item_src:
-                sml_body.append(f"        {s},")
-            sml_body.append("    ]")
+            sml_body = [f"    value: List[{item_cls}] = []"]
         else:
             # Heterogeneous or empty (e.g. CapabilityPropertyType lists
             # Range/Property/MLP exemplars) — basyx cannot represent a
@@ -451,7 +672,8 @@ def gen_template(template_path: str, output_dir: str):
     desc = extract_description(sm)
     if desc:
         sm_meta.append(f'    description: str = {json.dumps(desc)}')
-    walk(sm, "submodel_element")
+    walk(sm)
+
     admin = sm.get("administration", {})
     sm_meta.append(f'    VERSION: ClassVar[str] = "{admin.get("version", "1")}"')
     sm_meta.append(f'    REVISION: ClassVar[str] = "{admin.get("revision", "0")}"')
@@ -466,9 +688,7 @@ def gen_template(template_path: str, output_dir: str):
     aliases_emitted = set()
     for name in order:
         meta, cbody = classes[name]
-        if name in values_classes:
-            base = "ContainerValue"
-        elif name == sm_name:
+        if name == sm_name:
             base = "Submodel"
         elif name in entity_classes:
             base = "Entity"
@@ -478,16 +698,15 @@ def gen_template(template_path: str, output_dir: str):
             base = leaf_bases[name]
         else:
             base = "SubmodelElementCollection"
-        if name in values_classes:
-            # pydantic rejects a field whose name equals its type annotation
-            # (e.g. ``items: items = items()``) — alias the type as a
-            # TypeAlias, emitted once, before the first values class needing
-            # it.  The aliased class is always already defined at that point
-            # (child containers precede the parent values class in order).
-            cbody, alias_lines = _rewrite_clash_fields(cbody, aliases_emitted)
-            for a in alias_lines:
-                body.append(f"# alias so field ``{a.split(':')[0]}`` can name a class of the same id_short")
-                body.append(f"{a}")
+        # pydantic rejects a field whose name equals its type annotation
+        # (e.g. ``items: items``) — alias the type as a TypeAlias, emitted
+        # once, before the first class needing it.  The aliased class is
+        # always already defined at that point (children precede the parent
+        # container in order).
+        cbody, alias_lines = _rewrite_clash_fields(cbody, aliases_emitted)
+        for a in alias_lines:
+            body.append(f"# alias so field ``{a.split(':')[0]}`` can name a class of the same id_short")
+            body.append(f"{a}")
         body.append(f"class {name}({base}):")
         body.extend(meta)
         body.extend(cbody)
@@ -507,12 +726,14 @@ def gen_template(template_path: str, output_dir: str):
     typing_names = ["Any", "ClassVar", "List"]
     if "Dict[" in all_src:
         typing_names.append("Dict")
+    if "Optional[" in all_src:
+        typing_names.append("Optional")
     if ": TypeAlias" in all_src:
         typing_names.append("TypeAlias")
     lines.append(f"from typing import {', '.join(typing_names)}")
     lines.append('from aas_pydantic import (')
     aas_types = {"Submodel", "SubmodelElement", "SubmodelElementCollection",
-                 "SubmodelElementList", "Entity", "Qualifier", "ContainerValue",
+                 "SubmodelElementList", "Entity", "Qualifier",
                  "ExternalReference", "ModelReference", "Key"}
     aas_types |= set(ELEMENT_MAP.values())
     imports = sorted(t for t in _used_leaf_types if t in aas_types)
